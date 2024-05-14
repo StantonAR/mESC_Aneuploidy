@@ -2710,7 +2710,7 @@ library(ggbeeswarm)
 library(ensembldb)
 ```
 ##### Load necessary data
-Set working directory to the file containing the count matrix, feature list, and barcode lists.
+Set working directory to the file containing the count matrix, feature list, and barcode lists. Set working directory separately for early and aged data.
 
 ## EARLY TIMEPOINT CELL LINE DATA
 ## Load in gene expression and LMO tag data + gene annotations
@@ -2718,19 +2718,16 @@ Set working directory to the file containing the count matrix, feature list, and
 # load in sparse expression matrix for pool2
 ## features are genes (labeled by symbol)
 ## barcodes are cell IDs (ending with "-1")
-expression_matrix <- ReadMtx(mtx = "G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/matrix.mtx.gz",
-                             features = "G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/features.tsv.gz",
-                             cells = "G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/barcodes.tsv.gz")
+expression_matrix <- ReadMtx(mtx = "./matrix.mtx.gz",
+                             features = "./features.tsv.gz",
+                             cells = "./barcodes.tsv.gz")
 data_p0 <- CreateSeuratObject(counts = expression_matrix, min.cells = 3)
 rm(expression_matrix)
 
 # load gene annotations & append chr to list of expressed genes
-features_tsv <- read_delim("G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/features.tsv.gz",
+features_tsv <- read_delim("./features.tsv.gz",
                            delim = "\t", escape_double = FALSE,
                            col_names = FALSE, trim_ws = TRUE)
-genedata <- read_delim("G:/JAX/Code/MULTIseq/genedata.txt", 
-                       delim = "\t", escape_double = FALSE, 
-                       trim_ws = TRUE)
 features_tsv$chr <- genedata$`Chromosome/scaffold name`[match(features_tsv$X1, genedata$`Gene stable ID`)]
 ```
 
@@ -2871,19 +2868,16 @@ DimPlot(df_p0, reduction = "tsne")
 # load in sparse expression matrix for pool2
 ## features are genes (labeled by symbol)
 ## barcodes are cell IDs (ending with "-1")
-expression_matrix <- ReadMtx(mtx = "G:/JAX/Code/MULTIseq/Pool2/filtered_feature_bc_matrix/matrix.mtx.gz",
-                             features = "G:/JAX/Code/MULTIseq/Pool2/filtered_feature_bc_matrix/features.tsv.gz",
-                             cells = "G:/JAX/Code/MULTIseq/Pool2/filtered_feature_bc_matrix/barcodes.tsv.gz")
+expression_matrix <- ReadMtx(mtx = "./matrix.mtx.gz",
+                             features = "./features.tsv.gz",
+                             cells = "./barcodes.tsv.gz")
 data_p10 <- CreateSeuratObject(counts = expression_matrix, min.cells = 3)
 rm(expression_matrix)
 
 # load gene annotations & append chr to list of expressed genes
-features_tsv <- read_delim("G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/features.tsv.gz",
+features_tsv <- read_delim("./features.tsv.gz",
                            delim = "\t", escape_double = FALSE,
                            col_names = FALSE, trim_ws = TRUE)
-genedata <- read_delim("G:/JAX/Code/MULTIseq/genedata.txt", 
-                       delim = "\t", escape_double = FALSE, 
-                       trim_ws = TRUE)
 features_tsv$chr <- genedata$`Chromosome/scaffold name`[match(features_tsv$X1, genedata$`Gene stable ID`)]
 ```
 
