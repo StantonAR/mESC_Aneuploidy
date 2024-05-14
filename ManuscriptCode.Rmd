@@ -1,0 +1,3776 @@
+---
+title: "Analyses: Chromosome X Dosage Modulates Development of Aneuploidy in Genetically Diverse Mouse Embryonic Stem Cells"
+author: "Alex Stanton"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+options(stringsAsFactors = F)
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+knitr::opts_knit$set(progress = F)
+```
+
+# Analyses broken down into the following sections
+(1) Bulk RNA-seq and proteomics from Diversity Outbred mouse embryonic stem cells
+(2) Single-cell RNA-seq from Diversity outbred mouse embryonic stem cells
+(3) Single-cell RNA-seq from isogenic mouse embryonic stem cells (C3H/HeSn-Paf/J)
+(4) Human-mouse synteny analysis
+(5) Flow cytometry analysis
+(6) Karyotype annotations from WiCell analyzed human pluripotent stem cells
+
+---
+
+---
+
+## (1) Bulk RNA-seq and proteomics from Diversity Outbred mouse embryonic stem cells
+##### Load necessary libraries
+```{r, message = F}
+library(boot)
+library(cowplot)
+library(data.table)
+library(DescTools)
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggsci)
+library(ggExtra)
+library(ggbeeswarm)
+library(miscTools)
+library(plotly)
+library(plotrix)
+library(readr)
+library(readxl)
+library(reshape2)
+library(survcomp)
+library(tidyverse)
+library(ungeviz)
+library(UpSetR)
+```
+##### Load necessary data
+Load Rdata file "BulkDO" into the R environment, containing all necessary data for running this section of the code.
+
+##### Set Up Color Palettes
+```{r}
+# sex karyotype
+col.sex <- c("#CC0000", "#E0BB00", "#244D94")
+names(col.sex) <- c("XX", "XX/XO", "XY")
+# chromosomes
+col.chr <- rainbow(20)
+names(col.chr) <- as.character(c(1:19, "X"))
+```
+
+##### Generate useful data
+```{r}
+# generate list of...chromosome offsets to use for graphing
+chr.off <- cumsum(as.numeric(chr.lengths)) - chr.lengths
+# ...Chr breaks
+chr.breaks <- cumsum(as.numeric(chr.lengths))
+# ...Chr midpoints
+chr.midpts <- chr.off + diff(chr.off)/2
+# list of xx and xy samples - by original genotyping
+xx1.samples <- sample.metadata$samples[which(sample.metadata$orig.sex == "Female")]
+xy1.samples <- sample.metadata$samples[which(sample.metadata$orig.sex == "Male")]
+```
+
+## Assess aneuploidy by transcript & protein expression profiles
+### Generate list of genes to use for RNA & protein analyses & expression data with annotations
+```{r}
+# pare down to just the 170 shared samples
+rna.expr <- rna.expr[,colnames(rna.expr) %in% shared.samples]
+prot.expr <- prot.expr[,colnames(prot.expr) %in% shared.samples]
+# list of genes used for analyses
+## remove Riken genes & gene models
+rna.genes <- rna.annot$Gene.Symbol[match(rownames(rna.expr), rna.annot$ids)]
+names(rna.genes) <- rownames(rna.expr)
+rna.genes <- rna.genes[-grep("^Gm", rna.genes)]
+rna.genes <- rna.genes[-grep("Rik$", rna.genes)]
+prot.genes <- prot.annot$Gene.Symbol[match(rownames(prot.expr), prot.annot$ids)]
+names(prot.genes) <- rownames(prot.expr)
+prot.genes <- prot.genes[-grep("^Gm", prot.genes)]
+prot.genes <- prot.genes[-grep("Rik$", prot.genes)]
+
+# subset expression tables
+r1.df <- as.data.frame(rna.expr[rownames(rna.expr) %in% names(rna.genes),])
+p1.df <- as.data.frame(prot.expr[rownames(prot.expr) %in% names(prot.genes),])
+# only genes with expression data in all samples
+r1.df <- na.omit(r1.df)
+p1.df <- na.omit(p1.df)
+# add annotation data
+r2.df <- r1.df
+p2.df <- p1.df
+r2.df$ids <- rownames(r1.df)
+p2.df$ids <- rownames(p1.df)
+r2.df <- merge(r2.df, rna.annot, by = "ids", all = F)
+p2.df <- merge(p2.df, prot.annot, by = "ids", all = F)
+# add x-axis position for plotting along genome
+r2.df$axis.pt <- ((r2.df$start + r2.df$end)/2) + chr.off[r2.df$Chr]
+p2.df$axis.pt <- ((p2.df$gene.start + p2.df$gene.end)/2) + chr.off[p2.df$gene.chr]
+```
+
+#### Normalize expression values to population medians
+```{r}
+# normalize autosomal genes to total population
+r.popmed <- rowMedians(as.matrix(r2.df[r2.df$Chr %in% as.character(c(1:19)),2:171]))
+p.popmed <- rowMedians(as.matrix(p2.df[p2.df$Chr %in% as.character(c(1:19)),2:171]))
+r.normexp <- log2(r2.df[r2.df$Chr %in% as.character(c(1:19)),2:171]/r.popmed)
+p.normexp <- log2(p2.df[p2.df$Chr %in% as.character(c(1:19)),2:171]/p.popmed)
+r3.df <- r2.df
+p3.df <- p2.df
+r3.df[r2.df$Chr %in% as.character(c(1:19)),2:171] <- r.normexp
+p3.df[p2.df$Chr %in% as.character(c(1:19)),2:171] <- p.normexp
+# normalize chromosome X genes to samples of the same sex karyotype
+rxx.popmed <- rowMedians(as.matrix(r2.df[which(r2.df$Chr == "X"),2:171]))
+rxy.popmed <- rowMedians(as.matrix(r2.df[which(r2.df$Chr == "X"),2:171]))
+pxx.popmed <- rowMedians(as.matrix(p2.df[which(p2.df$Chr == "X"),2:171]))
+pxy.popmed <- rowMedians(as.matrix(p2.df[which(p2.df$Chr == "X"),2:171]))
+rxx.normexp <- log2(r2.df[which(r2.df$Chr == "X"),2:171]/rxx.popmed)
+rxy.normexp <- log2(r2.df[which(r2.df$Chr == "X"),2:171]/rxy.popmed)
+pxx.normexp <- log2(p2.df[which(p2.df$Chr == "X"),2:171]/pxx.popmed)
+pxy.normexp <- log2(p2.df[which(p2.df$Chr == "X"),2:171]/pxy.popmed)
+r3.df[which(r2.df$Chr == "X"),2:171] <- rxx.normexp
+r3.df[which(r2.df$Chr == "X"),2:171] <- rxy.normexp
+p3.df[which(p2.df$Chr == "X"),2:171] <- pxx.normexp
+p3.df[which(p2.df$Chr == "X"),2:171] <- pxy.normexp
+```
+
+### Create table for collecting data generated for each sample's chromosomes
+```{r}
+chr.info <- data.frame(matrix(nrow = 3400, ncol = 2))
+colnames(chr.info) <- c("sample", "chr")
+chr.info$sample <- rep(shared.samples, each = 20)
+chr.info$chr <- rep(chroms[1:20], 170)
+chr.info$chr <- factor(chr.info$chr, levels = c(as.character(1:19), "X"))
+chr.info$orig.sex <- sample.metadata$orig.sex[match(chr.info$sample, sample.metadata$samples)]
+```
+
+### Summary data for chromosomes
+#### Calculate median expression values for each autosome
+```{r}
+# RNA
+r.tmp <- r2.df[,1:172]
+r.tmp <- melt(r.tmp)
+r.tmp <- r.tmp[-which(r.tmp$Chr == "MT"),]
+r.tmp <- r.tmp[-which(r.tmp$Chr == "X"),]
+r.tmp <- as.data.frame(r.tmp %>%
+                        group_by(Chr, variable) %>%
+                        summarise(rna.median = median(value)))
+colnames(r.tmp) <- c("chr", "sample", "rna.median")
+chr.info <- merge(chr.info, r.tmp, by = c('sample','chr'), all.x = T)
+# protein
+p.tmp <- p2.df[,1:172]
+p.tmp <- melt(p.tmp)
+p.tmp <- p.tmp[-which(p.tmp$Chr == "MT"),]
+p.tmp <- p.tmp[-which(p.tmp$Chr == "X"),]
+p.tmp <- p.tmp[-which(p.tmp$Chr == "Y"),]
+p.tmp <- as.data.frame(p.tmp %>%
+                        group_by(Chr, variable) %>%
+                        summarise(prot.median = median(value)))
+colnames(p.tmp) <- c("chr", "sample", "prot.median")
+chr.info <- merge(chr.info, p.tmp, by = c('sample','chr'), all.x = T)
+
+# remove temporary objects
+rm(r.tmp, p.tmp)
+```
+
+#### Calculate sum expression values for chromosome X
+```{r}
+# RNA
+r.tmp <- r2.df[,1:172]
+r.tmp <- melt(r.tmp)
+r.tmp <- r.tmp[which(r.tmp$Chr == "X"),]
+r.tmp <- as.data.frame(r.tmp %>%
+                        group_by(Chr, variable) %>%
+                        summarise(rna.sum = sum(value)))
+colnames(r.tmp) <- c("chr", "sample", "rna.sum")
+chr.info <- merge(chr.info, r.tmp, by = c('sample','chr'), all.x = T)
+# protein
+p.tmp <- p2.df[,1:172]
+p.tmp <- melt(p.tmp)
+p.tmp <- p.tmp[which(p.tmp$Chr == "X"),]
+p.tmp <- as.data.frame(p.tmp %>%
+                        group_by(Chr, variable) %>%
+                        summarise(prot.sum = sum(value)))
+colnames(p.tmp) <- c("chr", "sample", "prot.sum")
+chr.info <- merge(chr.info, p.tmp, by = c('sample','chr'), all.x = T)
+
+# remove temporary objects
+rm(r.tmp, p.tmp)
+```
+
+### Normality
+#### Assess normality & make QQ plots - autosomes
+```{r}
+# assess whether chromosome expression values fit a normal distribution for both RNA & protein (p <= 0.01)
+chr.info$rna.normality <- rep(NA, nrow(chr.info))
+chr.info$prot.normality <- rep(NA, nrow(chr.info))
+for (c in 1:19) {
+  r.norm <- shapiro.test(chr.info$rna.median[which(chr.info$chr == c)])
+  p.norm <- shapiro.test(chr.info$prot.median[which(chr.info$chr == c)])
+  chr.info$rna.normality[which(chr.info$chr == c)] <- ifelse(r.norm[2] <= 0.01, "Abnormal", "Normal")
+  chr.info$prot.normality[which(chr.info$chr == c)] <- ifelse(p.norm[2] <= 0.01, "Abnormal", "Normal")
+}
+# determine which chromosomes are abnormal for both measures
+ab.chr <- intersect(unique(chr.info$chr[which(chr.info$rna.normality == "Abnormal")]), unique(chr.info$chr[which(chr.info$prot.normality == "Abnormal")]))
+# plot QQ plots for abnormal chromosomes with euploid references
+for (c in as.factor(1:19)) {
+  r.qq <- ggqqplot(chr.info[which(chr.info$chr == c),], x = "rna.median", color = ifelse(c %in% as.factor(ab.chr), "black", "gray70"), point.size = 12, alpha = 0.6) +
+    labs(x = "Theoretical",
+         y = "Observed") +
+    scale_y_continuous(breaks = c(6, 6.2, 6.4, 6.6)) +
+    coord_cartesian(ylim = c(5.98, 6.6)) +
+    guides(color = "none")
+  p.qq <- ggqqplot(chr.info[which(chr.info$chr == c),], x = "prot.median", color = ifelse(c %in% as.factor(ab.chr), "black", "gray70"), point.size = 12, alpha = 0.6) +
+    scale_y_continuous(breaks = c(9, 10, 11, 12)) +
+    coord_cartesian(ylim = c(9, 12)) +
+    labs(x = "Theoretical",
+         y = "Observed") +
+    guides(color = "none")
+}
+# remove temporary objects
+rm(ab.chr)
+```
+#### Assess normality & make QQ plots - chromosome X
+```{r}
+# assess whether chromosome expression values fit a normal distribution for both RNA & protein (p <= 0.01)
+f.tmp <- chr.info[which(chr.info$chr == "X"),]
+f.tmp <- f.tmp[which(f.tmp$orig.sex == "Female"),]
+r.norm <- shapiro.test(f.tmp$rna.sum)
+p.norm <- shapiro.test(f.tmp$prot.sum)
+chr.info$rna.normality[which(chr.info$chr == "X")] <- ifelse(r.norm[2] <= 0.01, "Abnormal", "Normal")
+chr.info$prot.normality[which(chr.info$chr == "X")] <- ifelse(p.norm[2] <= 0.01, "Abnormal", "Normal")
+# plot QQ plots for abnormal chromosomes with euploid references
+r.qq <- ggqqplot(f.tmp, x = "rna.sum", point.size = 12, color = "black", alpha = 0.6) +
+    scale_y_continuous(breaks = c(2700, 2867, 3033, 3200)) +
+    coord_cartesian(ylim = c(2700,3200)) +
+    labs(x = "Theoretical",
+         y = "Observed") +
+    guides(color = "none")
+p.qq <- ggqqplot(f.tmp, x = "prot.sum", point.size = 12, color = "black", alpha = 0.6) +
+    scale_y_continuous(breaks = c(1550, 1983, 2416, 2850)) +
+    coord_cartesian(ylim = c(1550,2850)) +
+    labs(x = "Theoretical",
+         y = "Observed") +
+    guides(color = "none")
+# remove temporary objects
+rm(f.tmp, r.norm, p.norm, r.qq, p.qq)
+```
+
+### Annotate samples aneuploid for chromosomes 1, 6, 8, and 11 by bootstrapping
+#### Transcript expression p-values
+```{r}
+print("Starting chromosome median bootstrapping code............")
+  # GENERATE PLACES TO STORE DATA FROM LOOPED OPERATIONS
+  ## Create dataframe to populate with bootstrapped p-values
+  boot.pvals <- as.data.frame(matrix(ncol = 170, nrow = 4))
+  colnames(boot.pvals) <- shared.samples
+  rownames(boot.pvals) <- paste0("Chr ", c(1,6,8,11))
+  ## Create list to host dataframes of bootstrapped perturbations of the data
+  boot.data <- list()
+  
+  # ITERATE THROUGH CHROMOSOMES
+  for (c in c(1,6,8,11)) {
+    time <- Sys.time()
+    print(paste0("Starting chromosome ", c, " analysis:"))
+    ## Subset data by chromosome
+    df <- r2.df
+    rownames(df) <- df[,1]
+    data.c <- df[which(df$Chr == c),]
+    data.c <- data.c[,2:171]
+    # GENERATE DATAFRAME TO STORE EACH OBSERVED (s0) AND EACH BOOTSTRAPPED (s1:10000) MEAN AER VALUE
+    boot.all <- as.data.frame(matrix(ncol = 170, nrow = 2001))
+    colnames(boot.all) <- colnames(data.c)
+    rownames(boot.all) <- paste0("s", 0:2000)
+    ## Calculate observed medians
+    boot.all[1,] <- unname(colMedians(data.c))
+    
+    # PERFORM BOOTSTRAPPING 2000 TIMES
+    data.c.bs <- as.data.frame(matrix(ncol = 170, nrow = nrow(data.c)))
+    colnames(data.c.bs) <- colnames(data.c)
+    rownames(data.c.bs) <- rownames(data.c)
+    pb1 <- txtProgressBar(min = 0, max = 2000, initial = 0, style = 2, char = "|")
+    print("Begin bootstrapping iterations")
+    for (bs in 1:2000) {
+      setTxtProgressBar(pb1, bs)
+      for (r in 1:nrow(data.c.bs)) {
+        data.c.bs[r,] <- sample(data.c[r,])
+      }
+      boot.all[bs+1,] <- unname(colMedians(data.c.bs, na.rm = T))
+    }
+    print("Bootstrapping done")
+    # Assign bootstrapped data for chromosome c to the c-th place in the list
+    print("Save bootstrapping data to dataframe")
+    boot.data[[c]] <- boot.all
+    # Calculate p-value for each observed sample for chromosome c
+    print("Calculating bootstrap p-values:")
+    pb2 <- txtProgressBar(min = 0, max = 170, initial = 0, style = 2, char = "|")
+    for (sc in 1:170) {
+      setTxtProgressBar(pb2, sc)
+      boot.pvals[c,sc] <- length(which(boot.all[2:2001,sc] >= boot.all[1,sc]))/2000
+    }
+    print(paste0("Chromosome ", c, " finished"))
+    print(Sys.time() - time)
+  }
+  r.anID.autosomes <- list()
+  r.anID.autosomes[[1]] <- boot.data
+  r.anID.autosomes[[2]] <- boot.pvals
+  names(r.anID.autosomes) <- c("bootstrap.data", "bootstrap.pvals")
+  
+# remove temporary objects
+rm(boot.data, boot.pvals, boot.all, data.c, data.c.bs, df, time, pb1, pb2)
+```
+
+#### Protein expression p-values
+```{r}
+print("Starting chromosome median bootstrapping code............")
+  # GENERATE PLACES TO STORE DATA FROM LOOPED OPERATIONS
+  ## Create dataframe to populate with bootstrapped p-values
+  boot.pvals <- as.data.frame(matrix(ncol = 170, nrow = 4))
+  colnames(boot.pvals) <- shared.samples
+  rownames(boot.pvals) <- paste0("Chr ", c(1,6,8,11))
+  ## Create list to host dataframes of bootstrapped perturbations of the data
+  boot.data <- list()
+  
+  # ITERATE THROUGH CHROMOSOMES
+  for (c in c(1,6,8,11)) {
+    time <- Sys.time()
+    print(paste0("Starting chromosome ", c, " analysis:"))
+    ## Subset data by chromosome
+    df <- p2.df
+    rownames(df) <- df[,1]
+    data.c <- df[which(df$Chr == c),]
+    data.c <- data.c[,2:171]
+    # GENERATE DATAFRAME TO STORE EACH OBSERVED (s0) AND EACH BOOTSTRAPPED (s1:10000) MEAN AER VALUE
+    boot.all <- as.data.frame(matrix(ncol = 170, nrow = 2001))
+    colnames(boot.all) <- colnames(data.c)
+    rownames(boot.all) <- paste0("s", 0:2000)
+    ## Calculate observed medians
+    boot.all[1,] <- unname(colMedians(data.c))
+    
+    # PERFORM BOOTSTRAPPING 2000 TIMES
+    data.c.bs <- as.data.frame(matrix(ncol = 170, nrow = nrow(data.c)))
+    colnames(data.c.bs) <- colnames(data.c)
+    rownames(data.c.bs) <- rownames(data.c)
+    pb1 <- txtProgressBar(min = 0, max = 2000, initial = 0, style = 2, char = "|")
+    print("Begin bootstrapping iterations")
+    for (bs in 1:2000) {
+      setTxtProgressBar(pb1, bs)
+      for (r in 1:nrow(data.c.bs)) {
+        data.c.bs[r,] <- sample(data.c[r,])
+      }
+      boot.all[bs+1,] <- unname(colMedians(data.c.bs, na.rm = T))
+    }
+    print("Bootstrapping done")
+    # Assign bootstrapped data for chromosome c to the c-th place in the list
+    print("Save bootstrapping data to dataframe")
+    boot.data[[c]] <- boot.all
+    # Calculate p-value for each observed sample for chromosome c
+    print("Calculating bootstrap p-values:")
+    pb2 <- txtProgressBar(min = 0, max = 170, initial = 0, style = 2, char = "|")
+    for (sc in 1:170) {
+      setTxtProgressBar(pb2, sc)
+      boot.pvals[c,sc] <- length(which(boot.all[2:2001,sc] >= boot.all[1,sc]))/2000
+    }
+    print(paste0("Chromosome ", c, " finished"))
+    print(Sys.time() - time)
+  }
+  p.anID.autosomes <- list()
+  p.anID.autosomes[[1]] <- boot.data
+  p.anID.autosomes[[2]] <- boot.pvals
+  names(p.anID.autosomes) <- c("bootstrap.data", "bootstrap.pvals")
+  
+# remove temporary objects
+rm(boot.data, boot.pvals, boot.all, data.c, data.c.bs, df, time, pb1, pb2)
+```
+
+#### Combine p-values
+```{r}
+# Create dataframe to add combined p-values to
+com.pv.autosomes <- as.data.frame(matrix(ncol = 170, nrow = 19))
+colnames(com.pv.autosomes) <- colnames(r.anID.autosomes[[2]])
+rownames(com.pv.autosomes) <- paste0("Chr", 1:19)
+
+# Calculate combined p-values
+for (c in c(1, 6, 8, 11)) {
+  for (s in 1:170) {
+    ips <- c(ifelse(r.anID.autosomes[[2]][c,s] == 0, r.anID.autosomes[[2]][c,s]+0.00001, r.anID.autosomes[[2]][c,s]),
+             ifelse(p.anID.autosomes[[2]][c,s] == 0, p.anID.autosomes[[2]][c,s]+0.00001, p.anID.autosomes[[2]][c,s]))
+    ips <- as.numeric(ips)
+    com.pv.autosomes[c,s] <- combine.test(ips, method = "z.transform")
+    }
+}
+
+# add ploidy status to chr.info dataframe
+chr.info$copies <- rep(2, nrow(chr.info))
+chr.info$copies[which(chr.info$chr == "X")] <- NA
+chr.info$copies[which(chr.info$chr == "1" & chr.info$sample %in% colnames(com.pv.autosomes[which(com.pv.autosomes[1,] <= 0.0001)]))] <- 3
+chr.info$copies[which(chr.info$chr == "6" & chr.info$sample %in% colnames(com.pv.autosomes[which(com.pv.autosomes[6,] <= 0.0001)]))] <- 3
+chr.info$copies[which(chr.info$chr == "8" & chr.info$sample %in% colnames(com.pv.autosomes[which(com.pv.autosomes[8,] <= 0.0001)]))] <- 3
+chr.info$copies[which(chr.info$chr == "11" & chr.info$sample %in% colnames(com.pv.autosomes[which(com.pv.autosomes[11,] <= 0.0001)]))] <- 3
+```
+
+### Annotate samples aneuploid for chromosomes X by bootstrapping
+#### Transcript expression p-values
+```{r}
+# GENERATE PLACES TO STORE DATA FROM LOOPED OPERATIONS
+## Create dataframe to populate with bootstrapped p-values
+boot.pvals <- as.data.frame(matrix(ncol = length(xx1.samples), nrow = 1))
+colnames(boot.pvals) <- xx1.samples
+rownames(boot.pvals) <- "Chr X"
+## Create list to host dataframes of bootstrapped perturbations of the data
+boot.data <- list()
+  
+# ITERATE THROUGH CHROMOSOMES
+    time <- Sys.time()
+    print(paste0("Starting chromosome X analysis:"))
+    ## Subset data by chromosome
+    df <- r2.df
+    rownames(df) <- df$ids
+    df <- df[which(df$Chr == "X"), colnames(df) %in% xx1.samples]
+    ### remove Xist RNA expression
+    data.c <- df[-which(rownames(df) == "ENSMUSG00000086503"),]
+    # GENERATE DATAFRAME TO STORE EACH OBSERVED (s0) AND EACH BOOTSTRAPPED (s1:10000) MEAN AER VALUE
+    boot.all <- as.data.frame(matrix(ncol = length(xx1.samples), nrow = 2001))
+    colnames(boot.all) <- colnames(data.c)
+    rownames(boot.all) <- paste0("s", 0:2000)
+    ## Calculate sum of chromosome X expression
+    boot.all[1,] <- unname(colSums(data.c))
+    
+    # PERFORM BOOTSTRAPPING 2000 TIMES
+    data.c.bs <- as.data.frame(matrix(ncol = length(xx1.samples), nrow = nrow(data.c)))
+    colnames(data.c.bs) <- colnames(data.c)
+    rownames(data.c.bs) <- rownames(data.c)
+    pb1 <- txtProgressBar(min = 0, max = 2000, initial = 0, style = 2, char = "|")
+    print("Begin bootstrapping iterations")
+    for (bs in 1:2000) {
+      setTxtProgressBar(pb1, bs)
+      for (r in 1:nrow(data.c.bs)) {
+        data.c.bs[r,] <- sample(data.c[r,])
+      }
+      boot.all[bs+1,] <- unname(colSums(data.c.bs, na.rm = T))
+    }
+    print("Bootstrapping done")
+    # Assign bootstrapped data for chromosome c to the c-th place in the list
+    print("Save bootstrapping data to dataframe")
+    boot.data[[1]] <- boot.all
+    # Calculate p-value for each observed sample for chromosome c
+    print("Calculating bootstrap p-values:")
+    pb2 <- txtProgressBar(min = 0, max = 88, initial = 0, style = 2, char = "|")
+    for (sc in 1:88) {
+      setTxtProgressBar(pb2, sc)
+      boot.pvals[1,sc] <- length(which(boot.all[2:2001,sc] <= boot.all[1,sc]))/2000
+    }
+    print(paste0("Chromosome X finished"))
+    print(Sys.time() - time)
+  r.anID.chrx <- list()
+  r.anID.chrx[[1]] <- boot.all
+  r.anID.chrx[[2]] <- boot.pvals
+  names(r.anID.chrx) <- c("bootstrap.data", "bootstrap.pvals")
+  
+# remove temporary objects
+rm(boot.data, boot.pvals, boot.all, data.c, data.c.bs, df, time, pb1, pb2)
+```
+#### Protein expression p-values
+```{r}
+# GENERATE PLACES TO STORE DATA FROM LOOPED OPERATIONS
+## Create dataframe to populate with bootstrapped p-values
+boot.pvals <- as.data.frame(matrix(ncol = length(xx1.samples), nrow = 1))
+colnames(boot.pvals) <- xx1.samples
+rownames(boot.pvals) <- "Chr X"
+## Create list to host dataframes of bootstrapped perturbations of the data
+boot.data <- list()
+  
+# ITERATE THROUGH CHROMOSOMES
+    time <- Sys.time()
+    print(paste0("Starting chromosome X analysis:"))
+    ## Subset data by chromosome
+    df <- p2.df
+    rownames(df) <- df$ids
+    data.c <- df[which(df$Chr == "X"), colnames(df) %in% xx1.samples]
+    # GENERATE DATAFRAME TO STORE EACH OBSERVED (s0) AND EACH BOOTSTRAPPED (s1:10000) MEAN AER VALUE
+    boot.all <- as.data.frame(matrix(ncol = length(xx1.samples), nrow = 2001))
+    colnames(boot.all) <- colnames(data.c)
+    rownames(boot.all) <- paste0("s", 0:2000)
+    ## Calculate sum of chromosome X expression
+    boot.all[1,] <- unname(colSums(data.c))
+    
+    # PERFORM BOOTSTRAPPING 2000 TIMES
+    data.c.bs <- as.data.frame(matrix(ncol = length(xx1.samples), nrow = nrow(data.c)))
+    colnames(data.c.bs) <- colnames(data.c)
+    rownames(data.c.bs) <- rownames(data.c)
+    pb1 <- txtProgressBar(min = 0, max = 2000, initial = 0, style = 2, char = "|")
+    print("Begin bootstrapping iterations")
+    for (bs in 1:2000) {
+      setTxtProgressBar(pb1, bs)
+      for (r in 1:nrow(data.c.bs)) {
+        data.c.bs[r,] <- sample(data.c[r,])
+      }
+      boot.all[bs+1,] <- unname(colSums(data.c.bs, na.rm = T))
+    }
+    print("Bootstrapping done")
+    # Assign bootstrapped data for chromosome c to the c-th place in the list
+    print("Save bootstrapping data to dataframe")
+    boot.data[[1]] <- boot.all
+    # Calculate p-value for each observed sample for chromosome c
+    print("Calculating bootstrap p-values:")
+    pb2 <- txtProgressBar(min = 0, max = 88, initial = 0, style = 2, char = "|")
+    for (sc in 1:88) {
+      setTxtProgressBar(pb2, sc)
+      boot.pvals[1,sc] <- length(which(boot.all[2:2001,sc] <= boot.all[1,sc]))/2000
+    }
+    print(paste0("Chromosome X finished"))
+    print(Sys.time() - time)
+  p.anID.chrx <- list()
+  p.anID.chrx[[1]] <- boot.all
+  p.anID.chrx[[2]] <- boot.pvals
+  names(p.anID.chrx) <- c("bootstrap.data", "bootstrap.pvals")
+  
+# remove temporary objects
+rm(boot.data, boot.pvals, boot.all, data.c, data.c.bs, df, time, pb1, pb2)
+```
+#### Combine p-values
+```{r}
+# Create dataframe to add combined p-values to
+com.pv.chrx <- as.data.frame(matrix(ncol = 88, nrow = 1))
+colnames(com.pv.chrx) <- colnames(r.anID.chrx[[2]])
+rownames(com.pv.chrx) <- "Chr X"
+
+# Calculate combined p-values
+for (s in 1:88) {
+  ips <- c(ifelse(r.anID.chrx[[2]][1,s] == 0, r.anID.chrx[[2]][1,s]+0.00001, r.anID.chrx[[2]][1,s]),
+           ifelse(p.anID.chrx[[2]][1,s] == 0, p.anID.chrx[[2]][1,s]+0.00001, p.anID.chrx[[2]][1,s]))
+  ips <- as.numeric(ips)
+  com.pv.chrx[1,s] <- combine.test(ips, method = "z.transform")
+  }
+
+# add ploidy status to chr.info dataframe
+chr.info$copies[which(chr.info$chr == "X")] <- "XX"
+chr.info$copies[which(chr.info$chr == "X" & chr.info$sample %in% xy1.samples)] <- "XY"
+chr.info$copies[which(chr.info$chr == "X" & chr.info$sample %in% colnames(com.pv.chrx[which(com.pv.chrx[1,] <= 0.0001)]))] <- "XX/XO"
+
+# create new vectors for XX and XX/XO samples
+xx2.samples <- chr.info$sample[which(chr.info$copies == "XX")]
+xo.samples <- chr.info$sample[which(chr.info$copies == "XX/XO")]
+
+# add sex chromosome info to sample.metadata
+sample.metadata$final.sex[sample.metadata$samples %in% xx2.samples] <- "XX"
+sample.metadata$final.sex[sample.metadata$samples %in% xo.samples] <- "XX/XO"
+sample.metadata$final.sex[sample.metadata$samples %in% xy1.samples] <- "XY"
+```
+
+### Assess X chromosome inactivation (XCI)
+#### Compare Xist expression between XX, potential XO, and XY
+```{r}
+# generate data for t-tests & plot
+xist <- data.frame(matrix(nrow = 170, ncol = 2))
+rownames(xist) <- shared.samples
+colnames(xist) <- c("Sex.Chromosomes", "Xist")
+# fill in data
+xkary <- chr.info[which(chr.info$chr == "X"),]
+xist$Sex.Chromosomes <- xkary$copies[match(rownames(xist), xkary$sample)]
+xist.ex <- t(r2.df[which(r2.df$ids == "ENSMUSG00000086503"),-1])
+xist$Xist <- as.numeric(xist.ex[match(rownames(xist), rownames(xist.ex)),1])
+
+# t-test of Xist expression levels between sex genotypes
+## XX vs. XY
+t_xx.xy <- t.test(xist$Xist[which(xist$Sex.Chromosomes == "XX")], xist$Xist[which(xist$Sex.Chromosomes == "XY")])
+## XX vs. XO
+t_xx.xo <- t.test(xist$Xist[which(xist$Sex.Chromosomes == "XX")], xist$Xist[which(xist$Sex.Chromosomes == "XX/XO")])
+## XY vs. XO
+t_xy.xo <- t.test(xist$Xist[which(xist$Sex.Chromosomes == "XY")], xist$Xist[which(xist$Sex.Chromosomes == "XX/XO")])
+
+# plot Xist expression by sex genotype
+xe <- ggplot(xist) +
+  theme_classic() +
+  geom_boxplot(aes(x = Sex.Chromosomes, y = Xist), outlier.shape = NA) +
+  geom_quasirandom(aes(x = Sex.Chromosomes, y = Xist, color = Sex.Chromosomes), size = 2.5, method = "quasirandom", width = 0.3) +
+  labs(x = "",
+       y = "Xist Expression") +
+  scale_x_discrete(labels = c("xo" = "XO\n ", "xx" = "XX\n ", "xy" = "XY\n ")) +
+  scale_color_manual(values = col.sex) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18)) +
+  annotate("segment", x = 1, xend = 1.9, y = 9.2, yend = 9.2) +
+  annotate("text", x = 1.45, y = 9.7, label =  paste0("p-value =\n", round(t_xx.xo$p.value, 6))) +
+  annotate("segment", x = 2.1, xend = 3, y = 9.2, yend = 9.2) +
+  annotate("text", x = 2.55, y = 9.7, label =  paste0("p-value =\n", round(t_xy.xo$p.value, 6)))
+```
+
+### Visualize transcript vs protein expression with ploidy annotated
+### To get plots for euploid chromosomes, just replace the selected chromosome in the first line of the ggplot call
+#### Chromosome 1
+```{r}
+id1 <- ggplot(chr.info[which(chr.info$chr == "1"),]) +
+  theme_classic() +
+  geom_point(aes(x = rna.median, y = prot.median, col = copies, size = copies, alpha = copies, shape = copies), show.legend = F) +
+  scale_color_manual(values = c("gray70", "darkorchid")) +
+  scale_size_manual(values = c(2.5,4)) +
+  scale_alpha_manual(values = c(0.6,1)) +
+  scale_shape_manual(values = c(16,17)) +
+  labs(title = "\nChromosome 1",
+       x = "Median Transcript Expression",
+       y = "Median Protein Expression") +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18)) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940), ylim = c(9.021505,11.968124)) +
+  guides()
+
+# remove temporary objects
+rm(id1)
+```
+#### Chromosome 6
+```{r}
+id6 <- ggplot(chr.info[which(chr.info$chr == "6"),]) +
+  theme_classic() +
+  geom_point(aes(x = rna.median, y = prot.median, col = copies, size = copies, alpha = copies, shape = copies), show.legend = F) +
+  scale_color_manual(values = c("gray70", "darkorchid")) +
+  scale_size_manual(values = c(2.5,4)) +
+  scale_alpha_manual(values = c(0.6,1)) +
+  scale_shape_manual(values = c(16,17)) +
+  labs(title = "\nChromosome 6",
+       x = "Median Transcript Expression",
+       y = "Median Protein Expression") +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18)) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940), ylim = c(9.021505,11.968124)) +
+  guides()
+
+# remove temporary objects
+rm(id6)
+```
+#### Chromosome 8
+```{r}
+id8 <- ggplot(chr.info[which(chr.info$chr == "8"),]) +
+  theme_classic() +
+  geom_point(aes(x = rna.median, y = prot.median, col = copies, size = copies, alpha = copies, shape = copies), show.legend = F) +
+  scale_color_manual(values = c("gray70", "darkorchid")) +
+  scale_size_manual(values = c(2.5,4)) +
+  scale_alpha_manual(values = c(0.6,1)) +
+  scale_shape_manual(values = c(16,17)) +
+  labs(title = "\nChromosome 8",
+       x = "Median Transcript Expression",
+       y = "Median Protein Expression") +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18)) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940), ylim = c(9.021505,11.968124))
+
+# remove temporary objects
+rm(id8)
+```
+#### Chromosome 11
+```{r}
+id11 <- ggplot(chr.info[which(chr.info$chr == "11"),]) +
+  theme_classic() +
+  geom_point(aes(x = rna.median, y = prot.median, col = copies, size = copies, alpha = copies, shape = copies), show.legend = F) +
+  scale_color_manual(values = c("gray70", "darkorchid")) +
+  scale_size_manual(values = c(2.5,4)) +
+  scale_alpha_manual(values = c(0.6,1)) +
+  scale_shape_manual(values = c(16,17)) +
+  labs(title = "\nChromosome 11",
+       x = "Median Transcript Expression",
+       y = "Median Protein Expression") +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18)) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940), ylim = c(9.021505,11.968124))
+
+# remove temporary objects
+rm(id11)
+```
+
+#### Chromosome X - XX/XO
+```{r}
+idx1 <- ggplot(chr.info[which(chr.info$chr == "X" & chr.info$sample %in% xx1.samples),]) +
+  theme_classic() +
+  geom_point(aes(x = rna.sum, y = prot.sum, col = copies, size = copies, alpha = copies, shape = copies), show.legend = F) +
+  scale_color_manual(values = c("gray70", "darkorchid")) +
+  scale_size_manual(values = c(2.5,4)) +
+  scale_alpha_manual(values = c(0.6,1)) +
+  scale_shape_manual(values = c(16,17)) +
+  scale_x_continuous(breaks = c(2700, 2800, 2900, 3000, 3100)) +
+  labs(title = "\nChromosome X: XX & XX/XO",
+       x = "Sum of Transcript Expression",
+       y = "Sum of Protein Expression") +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18))  +
+  coord_cartesian(ylim = c(1400, 2900))
+
+# remove temporary objects
+rm(idx1)
+```
+#### Chromosome X - XX/XO/XY
+```{r}
+idx2 <- ggplot(chr.info[which(chr.info$chr == "X"),]) +
+  theme_classic() +
+  geom_point(aes(x = rna.sum, y = prot.sum, col = copies), size = 2.5, show.legend = F) +
+  scale_x_continuous(breaks = c(2700, 2800, 2900, 3000, 3100)) +
+  scale_color_manual(values = col.sex) +
+  labs(title = "\nChromosome X: XX, XX/XO, XY",
+       x = "Sum of Transcript Expression",
+       y = "Sum of Protein Expression") +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18)) +
+  coord_cartesian(ylim = c(1400, 2900))
+
+# remove temporary objects
+rm(idx2)
+```
+
+### Summary of autosomal aneuploidies
+```{r}
+# pull euploid chromosome counts
+eu.ct <- data.frame(table(chr.info$sample[which(chr.info$copies == 2)], chr.info$copies[which(chr.info$copies == 2)]))
+# compile category lists for UpSet plot
+upset.info <- list("Euploid" = as.character(eu.ct$Var1[which(eu.ct$Freq == 19)]), "Chr1" = chr.info$sample[which(chr.info$chr == "1" & chr.info$copies == 3)], "Chr6" = chr.info$sample[which(chr.info$chr == "6" & chr.info$copies == 3)], "Chr8" = chr.info$sample[which(chr.info$chr == "8" & chr.info$copies == 3)], "Chr11" = chr.info$sample[which(chr.info$chr == "11" & chr.info$copies == 3)])
+# generate UpSet plot
+upset <- upset(fromList(upset.info),
+               sets = c("Chr11", "Chr8", "Chr6", "Chr1", "Euploid"),
+               keep.order = T,
+               main.bar.color = c(rep("gray70", 1), rep("darkorchid", 8)),
+               sets.x.label = "Number of Lines in Category",
+               mainbar.y.label = "Number of mESC Lines with\nSpecific Ploidy State",
+               text.scale = c(2, 2, 2, 2, 2, 2),
+               point.size = 4,
+               shade.color = "gray80")
+upset
+
+# add ploidy data to sample.metadata
+sample.metadata$is.euploid.all <- rep(FALSE, 170)
+sample.metadata$is.euploid.c1 <- rep(FALSE, 170)
+sample.metadata$is.euploid.c6 <- rep(FALSE, 170)
+sample.metadata$is.euploid.c8 <- rep(FALSE, 170)
+sample.metadata$is.euploid.c11 <- rep(FALSE, 170)
+sample.metadata$is.euploid.all[sample.metadata$samples %in% as.character(eu.ct$Var1[which(eu.ct$Freq == 19)])] <- TRUE
+sample.metadata$is.euploid.c1[sample.metadata$samples %in% chr.info$sample[which(chr.info$chr == "1" & chr.info$copies == 3)]] <- TRUE
+sample.metadata$is.euploid.c6[sample.metadata$samples %in% chr.info$sample[which(chr.info$chr == "6" & chr.info$copies == 3)]] <- TRUE
+sample.metadata$is.euploid.c8[sample.metadata$samples %in% chr.info$sample[which(chr.info$chr == "8" & chr.info$copies == 3)]] <- TRUE
+sample.metadata$is.euploid.c11[sample.metadata$samples %in% chr.info$sample[which(chr.info$chr == "11" & chr.info$copies == 3)]] <- TRUE
+
+# remove temporary objects
+rm(upset.info, upset)
+```
+
+### Plot population normalized gene expression per sample
+```{r}
+for (s in 1:170) {
+  # generate sample info
+  s.id <- shared.samples[s]
+  s2.id <- gsub("_repA", "", s.id)
+  ancop <- chr.info$copies[which(chr.info$sample == s.id & chr.info$chr != "X")]
+  names(ancop) <- chr.info$chr[which(chr.info$sample == s.id & chr.info$chr != "X")]
+  ancop <- ifelse(ancop == 2, "gray70", "darkorchid")
+  # generate sample data
+  rdat <- r3.df[,c(1,s+1,172:ncol(r3.df))]
+  colnames(rdat)[2] <- "expression"
+  rmed <- rdat %>%
+      group_by(Chr) %>%
+      summarise(chr.median = median(expression, na.rm = T))
+  rmed <- rmed[1:19,]
+  rmed$Chr <- as.numeric(rmed$Chr)
+  rmed <- rmed[order(rmed$Chr),]
+  pdat <- p3.df[,c(1,s+1,172:ncol(p3.df))]
+  colnames(pdat)[2] <- "expression"
+  pmed <- pdat %>%
+      group_by(Chr) %>%
+      summarise(chr.median = median(expression, na.rm = T))
+  pmed <- pmed[1:19,]
+  pmed$Chr <- as.numeric(pmed$Chr)
+  pmed <- pmed[order(pmed$Chr),]
+  
+  # plot RNA
+  rge <- ggplot(data = rdat[rdat$Chr %in% c(1:19),]) +
+    theme_classic2() +
+    geom_point(aes(x = axis.pt, y = expression, col = Chr)) +
+    scale_x_continuous(breaks = chr.midpts[1:19],
+                       labels = names(chr.lengths)[1:19],
+                       expand = c(0,0)) +
+    scale_color_manual(values = ancop) +
+    annotate("segment", x = c(0, chr.breaks[1:18]), xend = chr.breaks[1:19], y = rmed$chr.median, yend = rmed$chr.median, size = 2) +
+    geom_vline(xintercept = chr.breaks[1:18],
+                 color = "black") +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", size = 22),
+          axis.text = element_text(size = 20),
+          axis.title = element_text(size = 20)) +
+    labs(title = paste0("Cell Line: ", s2.id),
+         x = "Chromosome",
+         y = "Pop. Norm. Transcript Expression") +
+    ylim(-0.4, 0.4)
+  
+  # plot protein
+  pge <- ggplot(data = pdat[pdat$Chr %in% c(1:19),]) +
+    theme_classic() +
+    geom_point(aes(x = axis.pt, y = expression, col = Chr)) +
+    scale_x_continuous(breaks = chr.midpts[1:19],
+                       labels = names(chr.lengths)[1:19],
+                       expand = c(0,0)) +
+    scale_color_manual(values = ancop) +
+    annotate("segment", x = c(0, chr.breaks[1:18]), xend = chr.breaks[1:19], y = pmed$chr.median, yend = pmed$chr.median, size = 2) +
+    geom_vline(xintercept = chr.breaks[1:18],
+                 color = "black") +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", size = 22),
+          axis.text = element_text(size = 20),
+          axis.title = element_text(size = 20)) +
+    labs(title = paste0("Cell Line: ", s2.id),
+         x = "Chromosome",
+         y = "Pop. Norm. Protein Expression") +
+    ylim(-1, 1)
+}
+```
+
+## Genomic mapping of aneuploidy
+```{r}
+# Generate list of aneuploid annotations
+## all cases & combinations of aneuploidy
+ploidy.all <- sample.metadata$is.euploid.all == FALSE
+ploidy.all <- as.numeric(ploidy.all)
+ploidy.all <- setNames(ploidy.all, sample.metadata$samples)
+## aneuploid 8
+ploidy.8 <- sample.metadata$is.euploid.c8
+ploidy.8 <- as.numeric(ploidy.8)
+ploidy.8 <- setNames(ploidy.8, sample.metadata$samples)
+## aneuploid 11
+ploidy.11 <- sample.metadata$is.euploid.c11
+ploidy.11 <- as.numeric(ploidy.11)
+ploidy.11 <- setNames(ploidy.11, sample.metadata$samples)
+
+# Generate Xcovar (XX = 0, XY = 1, XO = 2)
+sex <- sample.metadata$final.sex
+sex <- ifelse(sex == "XX", 0, ifelse(sex == "XY", 1, 2))
+sex <- setNames(sex, sample.metadata$samples)
+sex <- as.matrix(sex)
+
+# genetic mapping of all aneuploid vs euploid
+out.all <- scan1(esc.probs, ploidy.all, Xcovar = sex, model = "binary")
+perm.all <- scan1perm(esc.probs, ploidy.all, Xcovar = sex, model = "binary", n_perm = 1000)
+plot(out.all, gmap, gap=0, col="black", main = "General Aneuploidy", xlab="Chromosome", ylim=c(0,10))
+abline(h = summary(perm.all, alpha = c(0.1, 0.05, 0.01)), col = c("green", "blue", "red"))
+## get chr X peak info
+all.pks_0.05 <- find_peaks(out.all, gmap, threshold = summary(perm.all, alpha = 0.05), drop = 1.5)
+all.pks_0.05
+## visualize founder effects at the chr X locus
+eff.all.X <- scan1blup(esc.probs[, 'X'], ploidy.all, esc.kinship_loco[["X"]])
+plot_coefCC(eff.all.X[,1:8], map = pmap['X'], scan1_output = out.all)
+rect(xleft = 143530457, ybottom = -7, xright = 157497091, ytop = 6.2, lwd = 1.5)
+
+# genetic mapping of chr 8 trisomy vs chr 8 disomy (regardless of other aneuploidies)
+out.8 <- scan1(esc.probs, ploidy.8, Xcovar = sex, model = "binary")
+perm.8 <- scan1perm(esc.probs, ploidy.8, Xcovar = sex, model = "binary", n_perm = 1000)
+plot(out.8, gmap, gap=0, col="black", main = "Aneuploidy 8", xlab="Chromosome", ylim=c(0,10))
+abline(h = summary(perm.8, alpha = c(0.1, 0.05, 0.01)), col = c("green", "blue", "red"))
+
+# genetic mapping of chr 11 trisomy vs chr 11 disomy (regardless of other aneuploidies)
+out.11 <- scan1(esc.probs, ploidy.11, Xcovar = sex, model = "binary")
+perm.11 <- scan1perm(esc.probs, ploidy.11, Xcovar = sex, model = "binary", n_perm = 1000)
+plot(out.11, gmap, gap=0, col="black", main = "Aneuploidy 11", xlab="Chromosome", ylim=c(0,10))
+abline(h = summary(perm.11, alpha = c(0.1, 0.05, 0.01)), col = c("green", "blue", "red"))
+```
+
+## Sex chromosome and aneuploidy interplay
+
+### Sex bias in (an)euploid proportions
+#### Compare percent of XX, XO, and XY lines identified as aneuploid
+```{r}
+sex.bias <- data.frame(matrix(nrow = 20, ncol = 6))
+colnames(sex.bias) <- c("Group", "Aneuploidy", "Normal.Lines", "Abnormal.Lines", "Total.Lines", "Abnormal.Percent")
+sex.bias$Group <- rep(c("Total", "XX", "XX/XO", "XY"), each = 5)
+sex.bias$Aneuploidy <- rep(c("Overall",1,6,8,11), 4)
+sex.bias$Aneuploidy <- factor(sex.bias$Aneuploidy, levels = c("Overall",1,6,8,11))
+sex.bias[1,3] <- unname(table(eu.ct$Freq[which(eu.ct$Freq == 19)]))
+sex.bias[6,3] <- unname(table(eu.ct$Freq[which(eu.ct$Freq == 19 & eu.ct$Var1 %in% xx2.samples)]))
+sex.bias[11,3] <- unname(table(eu.ct$Freq[which(eu.ct$Freq == 19 & eu.ct$Var1 %in% xo.samples)]))
+sex.bias[16,3] <- unname(table(eu.ct$Freq[which(eu.ct$Freq == 19 & eu.ct$Var1 %in% xy1.samples)]))
+sex.bias[c(1,6,11,16),4] <- c(170, length(xx2.samples), length(xo.samples), length(xy1.samples)) - sex.bias[c(1,6,11,16),3]
+for (i in 1:4) {
+  chrs <- c(1,6,8,11)
+  sex.bias[i+1,3:4] <- unname(table(chr.info$chr, chr.info$copies))[chrs[i],1:2]
+  sex.bias[i+6,3:4] <- unname(table(chr.info$chr[chr.info$sample %in% xx2.samples], chr.info$copies[chr.info$sample %in% xx2.samples]))[chrs[i],1:2]
+  sex.bias[i+11,3:4] <- unname(table(chr.info$chr[chr.info$sample %in% xo.samples], chr.info$copies[chr.info$sample %in% xo.samples]))[chrs[i],1:2]
+  sex.bias[i+16,3:4] <- unname(table(chr.info$chr[chr.info$sample %in% xy1.samples], chr.info$copies[chr.info$sample %in% xy1.samples]))[chrs[i],1:2]
+}
+sex.bias$Total.Lines <- sex.bias$Normal.Lines + sex.bias$Abnormal.Lines
+sex.bias$Abnormal.Percent <- round((sex.bias$Abnormal.Lines/sex.bias$Total.Lines)*100, 2)
+
+# calculate statistical significance for overall ploidy
+xs_overall <- chisq.test(sex.bias[c(6,11,16),3:4])
+xs_c1 <- chisq.test(sex.bias[c(7,12,17),3:4])
+xs_c6 <- chisq.test(sex.bias[c(8,13,18),3:4])
+xs_c8 <- chisq.test(sex.bias[c(9,14,19),3:4])
+xs_c11 <- chisq.test(sex.bias[c(10,15,20),3:4])
+
+# plot percentages of abnormal cell lines
+sb <- ggplot(sex.bias[which(sex.bias$Group != "Total"),]) +
+  theme_classic() +
+  geom_bar(aes(x = Aneuploidy, y = Abnormal.Percent, fill = Group), stat = "identity", position = position_dodge(), col = "black") +
+  scale_fill_manual(values = c(col.sex)) +
+  labs(x = "Trisomy",
+       y = "Percentage of Aneuploid Lines",
+       fill = "Sex Chromosomes") +
+  scale_x_discrete(labels = c("Any Chr", "Chr 1", "Chr 6", "Chr 8", "Chr 11")) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20)) +
+  annotate("segment", x = 0.6, xend = 1.4, y = 55, yend = 55) +
+  annotate("text", x = 1, y = 58, label = paste0("p-val = ", round(xs_overall$p.value, 4))) +
+  annotate("segment", x = 3.6, xend = 4.4, y = 35, yend = 35) +
+  annotate("text", x = 4, y = 38, label = paste0("p-val = ", round(xs_c8$p.value, 4))) +
+  annotate("segment", x = 4.6, xend = 5.4, y = 32, yend = 32) +
+  annotate("text", x = 5, y = 35, label = paste0("p-val = ", round(xs_c11$p.value, 4)))
+
+# remove temporary objects
+rm(xs_overall, xs_c1, xs_c6, xs_c8, xs_c11, sb)
+```
+
+### Plot correlation between chromosome X RNA/protein expression and aneuploid proportions
+```{r}
+# generate data object
+x.an.cor <- data.frame(matrix(nrow = 170, ncol = 5))
+colnames(x.an.cor) <- c("sample", "sex.chromosomes", "rna.sum", "prot.sum", "an.prop")
+x.an.cor$sample <- shared.samples
+x.an.cor$sex.chromosomes[which(x.an.cor$sample %in% xx2.samples)] <- "XX"
+x.an.cor$sex.chromosomes[which(x.an.cor$sample %in% xo.samples)] <- "XX/XO"
+x.an.cor$sex.chromosomes[which(x.an.cor$sample %in% xy1.samples)] <- "XY"
+x.an.cor$rna.sum <- chr.info$rna.sum[which(chr.info$chr == "X")]
+x.an.cor$prot.sum <- chr.info$prot.sum[which(chr.info$chr == "X")]
+x.an.cor$an.prop <- sex.bias$Abnormal.Percent[match(x.an.cor$sex.chromosomes, sex.bias$Group)]
+
+# plot correlation between: x = chr X expression, y = aneuploid proportion
+r.xan <- ggplot(x.an.cor, aes(x = an.prop, y = rna.sum)) +
+  theme_classic() +
+  geom_quasirandom(aes(col = sex.chromosomes), size = 2, method = "quasirandom", width = 1.8) +
+  geom_boxplot(aes(group = sex.chromosomes), outlier.shape = NA, width = 4, alpha = 0) +
+  geom_smooth(method='lm', formula = y~x, col = "black", se = F) +
+  stat_cor(method = "pearson", label.x = 40, label.y = max(x.an.cor$rna.sum)) +
+  labs(x = "Percentage of Aneuploid Lines",
+       y = "Sum of Transcript Expression",
+       col = "Sex Chromosomes") +
+  scale_color_manual(values = col.sex) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20))
+
+p.xan <- ggplot(x.an.cor, aes(x = an.prop, y = prot.sum)) +
+  theme_classic() +
+  geom_quasirandom(aes(col = sex.chromosomes), size = 2, method = "quasirandom", width = 1.8) +
+  geom_boxplot(aes(group = sex.chromosomes), outlier.shape = NA, width = 4, alpha = 0) +
+  geom_smooth(method='lm', formula = y~x, col = "black", se = F) +
+  stat_cor(method = "pearson", label.x = 40, label.y = max(x.an.cor$prot.sum)) +
+  labs(x = "Percentage of Aneuploid Lines",
+       y = "Sum of Protein Expression",
+       col = "Sex Chromosomes") +
+  scale_color_manual(values = col.sex) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20))
+
+# remove temporary objects
+rm(x.an.cor, r.xan, p.xan)
+```
+
+### Assess correlation between transcript and protein expression for X-linked genes
+```{r}
+# identify x-linked genes with both RNA and protein data
+xcor.genes <- intersect(r2.df$Gene.Symbol[which(r2.df$Chr == "X")], p2.df$Gene.Symbol[which(p2.df$Chr == "X")])
+# pare down RNA and protein expression data.frames to shared genes
+xcor.rna <- r2.df[r2.df$Gene.Symbol %in% xcor.genes,c(2:171,176)]
+xcor.prot <- p2.df[p2.df$Gene.Symbol %in% xcor.genes,c(2:171,181)]
+# generate data.frame for correlations
+xcor <- as.data.frame(matrix(nrow = 190, ncol = 4))
+rownames(xcor) <- xcor.genes
+colnames(xcor) <- c("iso1", "iso2", "schulz", "tsg")
+# calculate correlation
+for (g in 1:190) {
+  rg <- xcor.rna[xcor.rna$Gene.Symbol %in% xcor.genes[g],1:170]
+  pg <- xcor.prot[xcor.prot$Gene.Symbol %in% xcor.genes[g],1:170]
+  gexp <- t(rbind(rg, pg))
+  if(nrow(pg) == 1){
+    xcor$iso1[g] <- cor(gexp[,1], gexp[,2])
+  }else{
+    xcor$iso1[g] <- cor(gexp[,1], gexp[,2])
+    xcor$iso2[g] <- cor(gexp[,1], gexp[,3])
+  }
+}
+# add candidate genes from Schulz 2014 and X-linked TSGs from The Tumor Suppressor Gene Database
+xcor$schulz <- ifelse(rownames(xcor) %in% c("Eras", "Nono", "Dusp9", "Tfe3", "Nr0b1", "Zfx"), T, F)
+xcor$tsg <- ifelse(rownames(xcor) %in% rna.annot$Gene.Symbol[match(hTSGs$MouseID, rna.annot$ids)], T, F)
+
+# plot
+ggplot(xcor) +
+  theme_classic() +
+  geom_hline(yintercept = 0, size = 0.2) +
+  geom_point(aes(x = reorder(rownames(xcor), iso1), y = iso1), col = "gray80", size = 0.7) +
+  geom_point(data = subset(xcor, schulz == T), aes(x = reorder(rownames(xcor)[which(xcor$schulz == T)], iso1), y = iso1), col = "black", size = 3) +
+  geom_point(data = subset(xcor, tsg == T), aes(x = reorder(rownames(xcor)[which(xcor$tsg == T)], iso1), y = iso1), col = "black", size = 3) +
+  labs(title = "Chromosome X:",
+       subtitle = "Transcript ~ Protein correlation",
+       x = "Genes (ordered by correlation)",
+       y = "Pearson Correlation") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+### Assess Dusp9 expression by sex karyotype and ploidy
+#### ANOVA
+```{r}
+# Dusp9 gene expression data
+duspex <- rbind("rna.dusp9" = r2.df[which(r2.df$Gene.Symbol == "Dusp9"),2:171], "prot.dusp9" = p2.df[which(p2.df$Gene.Symbol == "Dusp9"),2:171])
+duspex <- as.data.frame(t(duspex))
+duspex$sex.chromosomes <- rep(NA, 170)
+duspex$sex.chromosomes <- sample.metadata$final.sex[match(rownames(duspex), sample.metadata$samples)]
+duspex$karyotype <- sample.metadata$is.euploid.all[match(rownames(duspex), sample.metadata$samples)]
+duspex$karyotype <- ifelse(duspex$karyotype == TRUE, "Normal", "Abnormal")
+duspex$karyotype <- factor(duspex$karyotype, levels = c("Normal", "Abnormal"))
+
+# perform ANOVA on Dusp9 data
+my_anova_rna <- aov(rna.dusp9 ~ sex.chromosomes + karyotype, duspex)
+my_anova_prot <- aov(prot.dusp9 ~ sex.chromosomes + karyotype, duspex)
+#Anova(my_anova, type = "III")
+```
+#### Plot
+```{r}
+duspex$karyotype <- ifelse(duspex$karyotype == "Normal", "E", "A")
+duspex$karyotype <- factor(duspex$karyotype, levels = c("E", "A"))
+
+# plot correlation of transcript & protein of Dusp9 (colored by sex chromosomes)
+dusp.pear <- cor(duspex$rna.dusp9, duspex$prot.dusp9)
+dusp.cor <- ggplot(duspex, aes(x = rna.dusp9, y = prot.dusp9, col = sex.chromosomes)) +
+  theme_classic() +
+  geom_point(size = 2.5) +
+  geom_smooth(method='lm', formula = y~x, col = "black", se = F) +
+  scale_color_manual(values = col.sex) +
+  labs(title = "Dusp9 Transcript~Protein",
+       x = "Transcript Expression",
+       y = "Protein Expression",
+       color = "Sex Chromosomes") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20)) +
+  annotate("text", x = 7.75, y = 25, label = paste0("Pearson Cor. = ", round(dusp.pear, 4)), size = 8)
+
+# plot Dusp9 transcript & protein by sex & ploidy
+r.dusp9 <- ggplot(duspex, aes(x = karyotype, y = rna.dusp9, col = sex.chromosomes)) +
+  theme_classic() +
+  geom_quasirandom(size = 2, method = "quasirandom", width = 0.2) +
+  geom_boxplot(col = "black", outlier.shape = NA, alpha = 0) +
+  scale_color_manual(values = col.sex) +
+  facet_wrap(~sex.chromosomes) +
+  labs(x = "Autosomal Karyotype",
+       y = "Dusp9 Transcript",
+       color = "Sex Chromosomes") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+
+p.dusp9 <- ggplot(duspex, aes(x = karyotype, y = prot.dusp9, col = sex.chromosomes)) +
+  theme_classic() +
+  geom_quasirandom(size = 2, method = "quasirandom", width = 0.2) +
+  geom_boxplot(col = "black", outlier.shape = NA, alpha = 0) +
+  scale_color_manual(values = col.sex) +
+  facet_wrap(~sex.chromosomes) +
+  labs(x = "Autosomal Karyotype",
+       y = "Dusp9 Protein",
+       color = "Sex Chromosomes") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+```
+
+# For TSGs
+## Written to use Fhl1 gene, but can be used for any TSG by subsituting the gene name assigned to the variable 'gene'
+```{r}
+gene <- "Fhl1"
+  
+#################
+
+geneex <- rbind("rna.gene" = r2.df[which(r2.df$Gene.Symbol == gene),2:171], "prot.gene" = p2.df[which(p2.df$Gene.Symbol == gene)[1],2:171])
+geneex <- as.data.frame(t(geneex))
+geneex$sex.chromosomes <- rep(NA, 170)
+geneex$sex.chromosomes <- sample.metadata$final.sex[match(rownames(geneex), sample.metadata$samples)]
+geneex$karyotype <- sample.metadata$is.euploid.all[match(rownames(geneex), sample.metadata$samples)]
+geneex$karyotype <- ifelse(geneex$karyotype == TRUE, "Normal", "Abnormal")
+geneex$karyotype <- factor(geneex$karyotype, levels = c("Normal", "Abnormal"))
+  
+gene.pear <- cor(geneex$rna.gene, geneex$prot.gene)
+gene.cor <- ggplot(geneex, aes(x = rna.gene, y = prot.gene, col = sex.chromosomes)) +
+  theme_bw() +
+  geom_point(cex = 2) +
+  geom_smooth(method='lm', formula = y~x, col = "black", se = F) +
+  scale_color_manual(values = col.sex) +
+  labs(title = paste0(gene, " Transcript~Protein"),
+       x = "Transcript Expression",
+       y = "Protein Expression",
+       color = "Sex Chromosomes") +
+  theme(legend.position = "bottom") +
+  annotate("text", x = 7.75, y = 25, label = paste0("Pearson Cor. = ", round(dusp.pear, 4)))
+
+# plot Fhl1 transcript & protein by sex & ploidy
+r.gene <- ggplot(geneex, aes(x = karyotype, y = rna.gene, col = sex.chromosomes)) +
+  theme_classic() +
+  geom_boxplot(col = "black", outlier.shape = NA) +
+  geom_quasirandom(cex = 1.8, method = "quasirandom", width = 0.2) +
+  scale_color_manual(values = col.sex) +
+  scale_y_continuous(breaks = c(6.5, 7.0, 7.5, 8.0, 8.5)) +
+  facet_wrap(~sex.chromosomes) +
+  labs(x = "Autosomal Karyotype",
+       y = paste0(gene, " Transcript"),
+       color = "Sex Chromosomes") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+
+p.gene <- ggplot(geneex, aes(x = karyotype, y = prot.gene, col = sex.chromosomes)) +
+  theme_classic() +
+  geom_boxplot(col = "black", outlier.shape = NA) +
+  geom_quasirandom(cex = 1.8, method = "quasirandom", width = 0.2) +
+  scale_color_manual(values = col.sex) +
+  facet_wrap(~sex.chromosomes) +
+  labs(x = "Autosomal Karyotype",
+       y = paste0(gene, " Protein"),
+       color = "Sex Chromosomes") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+```
+
+### 2-Cell-like cell state gene expression
+#### Calculate z-scores for Macfarlan et al 2012 & Amano et al 2013 data sets
+```{r}
+# import Zscan4+ upregulated genes data sets from Macfarlan 2012 & Amano 2013
+Macfarlan2012_2Cgenes <- read_csv("H:/Macfarlan2012_2Cgenes.csv", skip = 1)
+Amano2013_2Cgenes <- read_csv("H:/Amano2013_2Cgenes.csv", col_names = FALSE)
+# Find 2C genes present in DO data set
+m.overlap <- r2.df$ids[r2.df$Gene.Symbol %in% Macfarlan2012_2Cgenes$`Gene Name`]
+a.overlap <- r2.df$ids[r2.df$Gene.Symbol %in% Amano2013_2Cgenes$X1]
+# Percent of genes found in our data
+m.perc <- paste0("Genes in DO data: ", length(m.overlap), "/", nrow(Macfarlan2012_2Cgenes), " (", round((length(m.overlap)/nrow(Macfarlan2012_2Cgenes))*100,2), "%)")
+a.perc <- paste0("Genes in DO data: ", length(a.overlap), "/", nrow(Amano2013_2Cgenes), " (", round((length(a.overlap)/nrow(Amano2013_2Cgenes))*100,2), "%)")
+# subset data
+mdat <- r2.df[r2.df$ids %in% m.overlap, 2:171]
+adat <- r2.df[r2.df$ids %in% a.overlap, 2:171]
+mdat <- as.matrix(mdat)
+adat <- as.matrix(adat)
+# calculate z-scores for each sample
+mdat.z <- data.frame(matrix(nrow = nrow(mdat), ncol = ncol(mdat)))
+colnames(mdat.z) <- colnames(mdat)
+rownames(mdat.z) <- rownames(mdat)
+adat.z <- data.frame(matrix(nrow = nrow(adat), ncol = ncol(adat)))
+colnames(adat.z) <- colnames(adat)
+rownames(adat.z) <- rownames(adat)
+for (g in 1:nrow(mdat)) {
+  gene <- mdat[g,]
+  for (s in 1:ncol(mdat)) {
+    z <- (gene[s] - mean(gene))/sd(gene)
+    mdat.z[g,s] <- z
+  }
+}
+for (g in 1:nrow(adat)) {
+  gene <- adat[g,]
+  for (s in 1:ncol(adat)) {
+    z <- (gene[s] - mean(gene))/sd(gene)
+    adat.z[g,s] <- z
+  }
+}
+# sum z-scores for each sample
+mzsum <- colSums(mdat.z)
+azsum <- colSums(adat.z)
+# setup plotting data
+mzdata <- data.frame(matrix(ncol = 3, nrow = length(mzsum)))
+colnames(mzdata) <- c("sample", "sex", "zsum")
+mzdata[,1] <- colnames(mdat.z)
+mzdata[,2] <- sample.metadata$final.sex[match(mzdata$sample, sample.metadata$samples)]
+mzdata[,3] <- mzsum
+azdata <- data.frame(matrix(ncol = 3, nrow = length(azsum)))
+colnames(azdata) <- c("sample", "sex", "zsum")
+azdata[,1] <- colnames(adat.z)
+azdata[,2] <- sample.metadata$final.sex[match(azdata$sample, sample.metadata$samples)]
+azdata[,3] <- azsum
+
+# statistical analysis
+mt2c_xx.xo <- t.test(mzdata$zsum[which(mzdata$sex == "XX")], mzdata$zsum[which(mzdata$sex == "XX/XO")])
+mt2c_xx.xy <- t.test(mzdata$zsum[which(mzdata$sex == "XX")], mzdata$zsum[which(mzdata$sex == "XY")])
+at2c_xx.xo <- t.test(azdata$zsum[which(azdata$sex == "XX")], azdata$zsum[which(azdata$sex == "XX/XO")])
+at2c_xx.xy <- t.test(azdata$zsum[which(azdata$sex == "XX")], azdata$zsum[which(azdata$sex == "XY")])
+
+# plot data
+m2c <- ggplot(mzdata) +
+  theme_classic() +
+  geom_quasirandom(aes(x = sex, y = zsum, col = sex), size = 2, method = "quasirandom", width = 0.2) +
+  geom_boxplot(aes(x = sex, y = zsum), outlier.shape = NA, alpha = 0) +
+  geom_hline(yintercept = 0, lty = 2, col = "black") +
+  scale_color_manual(values = col.sex) +
+  labs(title = "Macfarlan et al. (2012) Nature",
+       subtitle = m.perc,
+       x = "",
+       y = "Sum of 2-Cell z-score",
+       color = "Sex Chromosomes") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        plot.subtitle = element_text(size = 16),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA)) +
+  annotate("segment", x = 1, xend = 2, y = 190, yend = 190) +
+  annotate("segment", x = 1, xend = 3, y = 250, yend = 250) +
+  annotate("text", x = 1.5, y = 220, label = paste0("p-val = ", format(mt2c_xx.xo$p.value, scientific = T, digits = 3))) +
+  annotate("text", x = 2, y = 280, label = paste0("p-val = ", format(mt2c_xx.xy$p.value, scientific = T, digits = 3)))
+
+a2c <- ggplot(azdata) +
+  theme_classic() +
+  geom_quasirandom(aes(x = sex, y = zsum, col = sex), size = 2, method = "quasirandom", width = 0.2) +
+  geom_boxplot(aes(x = sex, y = zsum), outlier.shape = NA, alpha = 0) +
+  geom_hline(yintercept = 0, lty = 2, col = "black") +
+  scale_color_manual(values = col.sex) +
+  labs(title = "Amano et al. (2013) Nature Comm.",
+       subtitle = a.perc,
+       x = "",
+       y = "Sum of 2-Cell z-score",
+       color = "Sex Chromosomes") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        plot.subtitle = element_text(size = 16),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA)) +
+  annotate("segment", x = 1, xend = 2, y = 45, yend = 45) +
+  annotate("segment", x = 1, xend = 3, y = 70, yend = 70) +
+  annotate("text", x = 1.5, y = 53, label = paste0("p-val = ", format(at2c_xx.xo$p.value, scientific = T, digits = 3))) +
+  annotate("text", x = 2, y = 78, label = paste0("p-val = ", format(at2c_xx.xy$p.value, scientific = T, digits = 3)))
+```
+
+## estimation of aneuploid cell proportion in each cell line based on fold-change estimates from (2) below
+```{r}
+e1.medmed <- median(chr.info$rna.median[which(chr.info$chr == 1 & chr.info$copies == 2)])
+e6.medmed <- median(chr.info$rna.median[which(chr.info$chr == 6 & chr.info$copies == 2)])
+e8.medmed <- median(chr.info$rna.median[which(chr.info$chr == 8 & chr.info$copies == 2)])
+e11.medmed <- median(chr.info$rna.median[which(chr.info$chr == 11 & chr.info$copies == 2)])
+
+# pull the range of aneuploid RNA medians for for chr 1, 6, 8, 11
+a1.range <- range(chr.info$rna.median[which(chr.info$chr == 1 & chr.info$copies == 3)])
+a6.range <- range(chr.info$rna.median[which(chr.info$chr == 6 & chr.info$copies == 3)])
+a8.range <- range(chr.info$rna.median[which(chr.info$chr == 8 & chr.info$copies == 3)])
+a11.range <- range(chr.info$rna.median[which(chr.info$chr == 11 & chr.info$copies == 3)])
+
+# calculate aneuploid proportion ranges
+# ((aneuploid value - euploid median)/euploid median)/0.4 * 100%
+a1.min <- ((a1.range[1] - e1.medmed)/e1.medmed)/0.4 * 100
+a1.max <- ((a1.range[2] - e1.medmed)/e1.medmed)/0.4 * 100
+a6.min <- ((a6.range[1] - e6.medmed)/e6.medmed)/0.4 * 100
+a6.max <- ((a6.range[2] - e6.medmed)/e6.medmed)/0.4 * 100
+a8.min <- ((a8.range[1] - e8.medmed)/e8.medmed)/0.4 * 100
+a8.max <- ((a8.range[2] - e8.medmed)/e8.medmed)/0.4 * 100
+a11.min <- ((a11.range[1] - e11.medmed)/e11.medmed)/0.4 * 100
+a11.max <- ((a11.range[2] - e11.medmed)/e11.medmed)/0.4 * 100
+
+# plot
+ar1 <- ggplot(chr.info[chr.info$chr == "1",]) +
+  theme_classic() +
+  geom_vline(xintercept = e1.medmed, col = "black", size = 1) +
+  geom_vpline(aes(x = rna.median, y = copies, col = copies), size = 0.6) +
+  labs(title = "Chromosome 1",
+       x = "Median Transcript Expression") +
+  annotate("text", x = mean(a1.range), y = 2.4, label = paste0(round(a1.min,2), "% - ", round(a1.max,2), "%"), col = "darkorchid", size = 6) +
+  scale_color_manual(values = c("grey70", "darkorchid")) +
+  scale_y_discrete(labels = c("E", "A")) +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(color = c("black", "darkorchid"))) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940))
+
+ar6 <- ggplot(chr.info[chr.info$chr == "6",]) +
+  theme_classic() +
+  geom_vline(xintercept = e6.medmed, col = "black", size = 1) +
+  geom_vpline(aes(x = rna.median, y = copies, col = copies), size = 0.6) +
+  labs(title = "Chromosome 6",
+       x = "Median Transcript Expression") +
+  annotate("text", x = mean(a6.range), y = 2.4, label = paste0(round(a6.min,2), "% - ", round(a6.max,2), "%"), col = "darkorchid", size = 6) +
+  scale_color_manual(values = c("grey70", "darkorchid")) +
+  scale_y_discrete(labels = c("E", "A")) +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(color = c("black", "darkorchid"))) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940))
+
+ar8 <- ggplot(chr.info[chr.info$chr == "8",]) +
+  theme_classic() +
+  geom_vline(xintercept = e8.medmed, col = "black", size = 1) +
+  geom_vpline(aes(x = rna.median, y = copies, col = copies), size = 0.6) +
+  labs(title = "Chromosome 8",
+       x = "Median Transcript Expression") +
+  annotate("text", x = mean(a8.range), y = 2.4, label = paste0(round(a8.min,2), "% - ", round(a8.max,2), "%"), col = "darkorchid", size = 6) +
+  scale_color_manual(values = c("grey70", "darkorchid")) +
+  scale_y_discrete(labels = c("E", "A")) +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(color = c("black", "darkorchid"))) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940))
+
+ar11 <- ggplot(chr.info[chr.info$chr == "11",]) +
+  theme_classic() +
+  geom_vline(xintercept = e11.medmed, col = "black", size = 1) +
+  geom_vpline(aes(x = rna.median, y = copies, col = copies), size = 0.6) +
+  labs(title = "Chromosome 11",
+       x = "Median Transcript Expression") +
+  annotate("text", x = mean(a11.range), y = 2.4, label = paste0(round(a11.min,2), "% - ", round(a11.max,2), "%"), col = "darkorchid", size = 6) +
+  scale_color_manual(values = c("grey70", "darkorchid")) +
+  scale_y_discrete(labels = c("E", "A")) +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(color = c("black", "darkorchid"))) +
+  guides(col = "none",
+         size = "none") +
+  coord_cartesian(xlim = c(5.992524,6.581940))
+```
+
+---
+
+# (2) Single-cell RNA-seq from Diversity outbred mouse embryonic stem cells
+##### Load necessary libraries
+```{r, message = F}
+library(Matrix)
+library(readr)
+library(Seurat)
+library(dplyr)
+library(ggpubr)
+library(gplots)
+library(cowplot)
+library(ggridges)
+library(reshape2)
+library(miscTools)
+library(beanplot)
+library(mixtools)
+library(pheatmap)
+library(zoo)
+library(squash)
+library(biomaRt)
+library(devtools)
+library(Rtsne)
+library(scran)
+library(CONICSmat)
+library(UpSetR)
+library(AnnotationHub)
+library(clusterProfiler)
+library(DOSE)
+library(ungeviz)
+library(org.Mm.eg.db)
+library(GGally)
+library(ggplot2)
+library(ggbeeswarm)
+library(ensembldb)
+```
+##### Load necessary data
+Load Rdata file "scDO" into the R environment, containing all necessary data for running this section of the code.
+
+## Pre-process & QC Data
+```{r}
+# set row & column names for the count matrix
+## gene_ids - ENSEMBL IDs
+gene_ids <- genes$X1
+rownames(counts) <- gene_ids
+colnames(counts) <- cell_ids
+
+# create Seurat object from sparse matrix
+data <- CreateSeuratObject(counts = counts,
+                           min.cells = 3,
+                           min.features = 200,
+                           project = "DO mESCs",
+                           names.delim = "-",
+                           names.field = 2)
+# add sample ID
+samples <- sampleBC$id[match(colnames(data), sampleBC$Barcode)]
+data <- SetIdent(data, value = samples)
+
+# look at description of data
+data
+```
+
+```{r}
+# calculate mitochondrial content
+mito.genenames <- grep("^mt-", genes$X2, value = T)
+mito.geneids <- genes$X1[genes$X2 %in% mito.genenames]
+x <- as.array(GetAssayData(object = data, slot = "counts"))
+percent.mito <- colSums(x[mito.geneids,])/colSums(x)*100
+rm(x)
+data <- AddMetaData(data, percent.mito, col.name = "percent.mito")
+
+# add samples as meta data
+data <- AddMetaData(data, unname(data@active.ident), col.name = "line")
+
+# QC metric visualization
+qc1 <- VlnPlot(data, features = "nFeature_RNA", pt.size = 0.1) + NoLegend()
+qc2 <- VlnPlot(data, features = "nCount_RNA", pt.size = 0.1) + NoLegend()
+qc3 <- VlnPlot(data, features = "percent.mito", pt.size = 0.1) + NoLegend()
+qc4 <- FeatureScatter(data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+qc5 <- FeatureScatter(data, feature1 = "nFeature_RNA", feature2 = "percent.mito")
+```
+
+### Filter Data on QC Metrics
+```{r}
+# filter out cells with >10% mitochondrial reads & 
+data.filt <- subset(data, subset = percent.mito < 10 & nCount_RNA > 2000, idents = unique(sampleBC$id))
+```
+
+```{r, results = "hold"}
+print(paste0("Pre-filtered Cell Line Counts (Total Cells = ", ncol(data), "):"))
+table(data@meta.data$line)
+```
+```{r, results = "hold"}
+print(paste0("QC Filtered Cell Line Counts (Total Cells = ", ncol(data.filt), "):"))
+table(data.filt@meta.data$line)
+```
+
+## Assess Need for Cell Cycle Regression
+```{r}
+cell_cycle_genes <- read_csv(url("https://raw.githubusercontent.com/hbc/tinyatlas/master/cell_cycle/Mus_musculus.csv"))
+# connect to AnnotationHub
+ah <- AnnotationHub()
+# access the Ensembl database for organism
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+# acquire the latest annotation files
+id <- ahDb %>%
+  mcols() %>%
+  rownames() %>%
+  tail(n = 1)
+# download the appropriate Ensembldb database
+edb <- ah[[id]]
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame")
+# select annotations of interest
+annotations <- annotations %>%
+  dplyr::select(gene_id, gene_name, seq_name, gene_seq_start, gene_seq_end, gene_biotype, description, seq_coord_system)
+# get gene names for Ensembl IDs for each gene
+cell_cycle_markers <- dplyr::left_join(cell_cycle_genes, annotations, by = c("geneID" = "gene_id"))
+# acquire the S phase genes
+s_genes <- cell_cycle_markers %>%
+  dplyr::filter(phase == "S") %>%
+  pull("geneID")
+# acquire the G2M phase genes        
+g2m_genes <- cell_cycle_markers %>%
+  dplyr::filter(phase == "G2/M") %>%
+  pull("geneID")
+```
+
+```{r}
+# rough normalization of the QC filtered data for cell cycle scoring
+data.filt2 <- NormalizeData(data.filt, normalization.method = "LogNormalize", scale.factor = 1e6)
+# perform cell cycle scoring
+# use QC filtered & rough log normalized data
+data.filt2 <- CellCycleScoring(data.filt2,
+                               g2m.features = g2m_genes,
+                               s.features = s_genes)
+# identify the most variable genes
+data.filt2 <- FindVariableFeatures(data.filt2, 
+                                     selection.method = "vst",
+                                     nfeatures = 2000, 
+                                     verbose = FALSE)
+# scale the counts
+data.filt2 <- ScaleData(data.filt2)
+# perform PCA
+data.filt2 <- RunPCA(data.filt2)
+```
+### PCs by Cell Cycle {.tabset .tabset-fade}
+#### PC1
+```{r, fig.height = 3, results = "hold"}
+# plot PCAs
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(1,2),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(1,3),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(1,4),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(1,5),
+        cols = c("red", "goldenrod2", "blue"))
+```
+#### PC2
+```{r, fig.height = 3, results = "hold"}
+# plot PCAs
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(2,1),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(2,3),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(2,4),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(2,5),
+        cols = c("red", "goldenrod2", "blue"))
+```
+#### PC3
+```{r, fig.height = 3, results = "hold"}
+# plot PCAs
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(3,1),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(3,2),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(3,4),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(3,5),
+        cols = c("red", "goldenrod2", "blue"))
+```
+#### PC4
+```{r, fig.height = 3, results = "hold"}
+# plot PCAs
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(4,1),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(4,2),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(4,3),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(4,5),
+        cols = c("red", "goldenrod2", "blue"))
+```
+#### PC5
+```{r, fig.height = 3, results = "hold"}
+# plot PCAs
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(5,1),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(5,2),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(5,3),
+        cols = c("red", "goldenrod2", "blue"))
+DimPlot(data.filt2,
+        reduction = "pca",
+        group.by= "Phase", 
+        split.by = "Phase",
+        dims = c(5,4),
+        cols = c("red", "goldenrod2", "blue"))
+```
+
+### General Survey of Cell Cycle
+#### Phase% x Line
+There does not seem to be a PC that splits significantly based on cell cycle, so it does not need to be regressed out of this data. However, we can also visualize proprtions of cells in each phase of the cell cycle to understand overall trends.
+```{r, results = "hold"}
+phase.ct <- as.data.frame(table(data.filt2@meta.data$Phase, data.filt2@meta.data$line))
+cell.ct <- as.data.frame(table(data.filt2@meta.data$line))
+for (r in c(1:nrow(phase.ct))) {
+  phase.ct[r,3] <- (phase.ct[r,3]/cell.ct[match(phase.ct$Var2[r], cell.ct$Var1),2])*100
+}
+ggplot(phase.ct, aes(x = Var2, y = Freq, fill = Var1)) +
+  geom_bar(stat = "identity", position=position_dodge()) +
+  scale_fill_manual(values = c("red", "goldenrod2", "blue")) +
+  labs(x = "",
+       y = "Percent of Cells in Cell Cycle Phase",
+       fill = "CC Phase") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+rm(phase.ct, cell.ct)
+```
+#### Read Count x Phase
+```{r}
+VlnPlot(data.filt2, features = "nCount_RNA", pt.size = 0.1, group.by = "Phase", cols = c("red", "goldenrod2", "blue"))
+```
+#### Genes x Phase
+```{r}
+VlnPlot(data.filt2, features = "nFeature_RNA", pt.size = 0.1, group.by = "Phase", cols = c("red", "goldenrod2", "blue"))
+```
+#### MT% x Phase
+```{r}
+VlnPlot(data.filt2, features = "percent.mito", pt.size = 0.1, group.by = "Phase", cols = c("red", "goldenrod2", "blue"))
+```
+
+# Separate by Sample & Transform Each Sample Individually
+The biggest source of variation in this data set comes from cell line differences. If we were interested in differences due to genotype, this would be useful. However, the current intent is to use this scRNA-seq data set to identify aneuploid cells and analyze distributions of aneuploidies, fold-changes in expression from aneuploid chromosomes, and DE genes in specific aneuploid contexts (especially trisomy 8 vs euploid cells). Therefore, we will analyze each sample separately in downstream applications.
+```{r}
+# add meta data calculated from QC data to non-scaled data
+data.filt <- AddMetaData(data.filt, data.filt2@meta.data$S.Score, col.name = "S.Score")
+data.filt <- AddMetaData(data.filt, data.filt2@meta.data$G2M.Score, col.name = "G2M.Score")
+data.filt <- AddMetaData(data.filt, data.filt2@meta.data$Phase, col.name = "Phase")
+
+# separated by cell lines
+object.list <- SplitObject(data.filt, split.by = "line")
+for (s in c(1:12)) {
+  object.list[[s]] <- NormalizeData(object.list[[s]], normalization.method = "LogNormalize", scale.factor = 1e6)
+}
+
+# perform SCTransform on each Seurat object
+for (i in 1:length(object.list)) {
+    object.list[[i]] <- SCTransform(object.list[[i]], verbose = F)
+}
+
+# look at the first cell line as an example
+object.list$PB357.01@assays
+head(object.list$PB357.01@meta.data)
+```
+
+# Identify & Annotate Aneuploid Cells
+```{r, results = "hide"}
+# identify aneuploid cells (90%+ probability of component 2)
+## create lists to collect posterior probabilities & component assignments
+### generate list of posterior probabilities for component 2
+an.cells <- list()
+### generate list for aneuploid/euoploid assignments
+an.cells.id <- list()
+## subset genes from chromosomes 1-19
+filt.genes <- annotations[annotations$seq_name %in% c(1:19),]
+## construct chromosome size/position table for CONICSmat
+regions <- cbind("Chrom" = c(1:19), "Start" = rep(0,19), "End" = chr.lengths[c(1:19)], "Lengths" = chr.lengths[c(1:19)])
+## process each Seurat object for CONICSmat, run CONICSmat on each sample, then identify aneuploid cells in commonly aneuploid chromosomes
+for (s in c(1:12)) {
+  ### extract expression data for individual cell line & log2 transform
+  df <- object.list[[s]]
+  log_data <- GetAssayData(df@assays$RNA)
+  log2_data <- log(expm1(log_data)+1, 2)
+  l2df <- log2_data
+  ### setup necessary gene/chromosome info for CONICSmat analysis
+  gene_pos <- filt.genes[filt.genes$gene_id %in% rownames(l2df), c(1:5)]
+  colnames(gene_pos) <- c("ensembl_gene_id", "mgi_symbol", "chromosome_name", "start_position", "end_position")
+  #### !!!only using chromosomes 1-8, 11-19 because chromosomes 9 & 10 cause issues (but do not accumulate aneuploidies anyway)
+  regions2 <- regions[c(1:8,11:19),]
+  ### filter expression data to only genes with position info & expressed in at least 5 cells
+  l2df <- filterMatrix(l2df, gene_pos$ensembl_gene_id, minCells = 5)
+  ### calculate normalization factor
+  normFactor <- calcNormFactors(l2df)
+  ### rename genes with gene symbols instead of ENSEMBL IDs
+  l2df@Dimnames[[1]] <- annotations$gene_name[match(l2df@Dimnames[[1]], annotations$gene_id)]
+  ### analyze with mixed Gaussian model in CONICSmat
+  l <- plotAll(l2df, normFactor, regions2, gene_pos, as.character(names(object.list)[s]))
+  ### subset only chromosomes 1, 6, 8, and 11 (commonly accumulating aneuploid chromosomes)
+  l2 <- l[,c(1,6,8,9)]
+  an.cells[[s]] <- l[,c(1,6,8,9)]
+  names(an.cells)[[s]] <- names(object.list)[s]
+  ### assign cells as aneuploid (1) or euploid (0) based on p-val threshold of 0.9
+  l3 <- l2
+  for (c in c(1:4)) {
+    l3[,c] <- ifelse(l2[,c] >= 0.9, 1, 0)
+  }
+  an.cells.id[[s]] <- l3
+}
+```
+
+```{r}
+# generate single object to collect ploidy statuses
+## create empty data.frame (cells x chromosome+overall ploidy)
+ploidy.annot <- as.data.frame(matrix(nrow = 5992, ncol = 6))
+colnames(ploidy.annot) <- c("cell.id", "c1", "c6", "c8", "c11", "condensed")
+## populate with cell ids
+ploidy.annot$cell.id <- colnames(data.filt)
+## add corresponding chromosome 1, 6, 8, and 11 ploidy annotations to data.frame
+temp <- rbind(an.cells.id[[1]], an.cells.id[[2]], an.cells.id[[3]], an.cells.id[[4]], an.cells.id[[5]], an.cells.id[[6]], an.cells.id[[7]], an.cells.id[[8]], an.cells.id[[9]], an.cells.id[[10]], an.cells.id[[11]], an.cells.id[[12]])
+for (r in c(1:5992)) {
+  ploidy.annot[r,c(2:5)] <- temp[match(ploidy.annot$cell.id[r], rownames(temp)),c(1:4)]
+}
+rm(temp)
+## add condensed version of chromosome 1, 6, 8, and 11 ploidy annotations
+## order: [chr 1][chr 6][chr 8][chr 11]
+## 0 = euploid; 1 = aneuploid
+for (r in c(1:5992)) {
+  ploidy.annot[r,6] <- paste0(ploidy.annot[r,2], ploidy.annot[r,3], ploidy.annot[r,4], ploidy.annot[r,5])
+}
+
+# generate UpSet plot to visualize categories of ploidy status
+upsetinfo <- list(Euploid = which(ploidy.annot$condensed == "0000"), Chr1=which(ploidy.annot$c1 == 1), Chr6=which(ploidy.annot$c6 == 1), Chr8=which(ploidy.annot$c8 == 1), Chr11=which(ploidy.annot$c11 == 1))
+upset <- upset(fromList(upsetinfo),
+                   sets = c("Chr11", "Chr8", "Chr6", "Chr1", "Euploid"),
+                   keep.order = T,
+                   main.bar.color = c(rep("black", 1), rep("gray30", 4), rep("gray45", 6), rep("gray60", 4), rep("gray75", 1)),
+                   sets.x.label = "Number of Lines in Category",
+                   mainbar.y.label = "Number of mESC Cells with\nSpecific Ploidy State",
+                   text.scale = c(1.5, 1, 1, 1.5, 1.2, 1.3),
+                   shade.color = "gray80")
+upset
+```
+
+```{r}
+for (s in c(1:12)) {
+  # isolate seurat object for specific sample
+  df <- object.list[[s]]
+  # pull list of cells (in order)
+  cells <- colnames(df)
+  # construct data frame with ploidy info for pulled cells
+  pl <- as.data.frame(matrix(nrow = length(cells), ncol = 6))
+  colnames(pl) <- c("cell.id", "c1", "c6", "c8", "c11", "condensed")
+  pl$cell.id <- cells
+  pl$c1 <- ploidy.annot$c1[match(pl$cell.id, ploidy.annot$cell.id)]
+  pl$c6 <- ploidy.annot$c6[match(pl$cell.id, ploidy.annot$cell.id)]
+  pl$c8 <- ploidy.annot$c8[match(pl$cell.id, ploidy.annot$cell.id)]
+  pl$c11 <- ploidy.annot$c11[match(pl$cell.id, ploidy.annot$cell.id)]
+  pl$condensed <- ploidy.annot$condensed[match(pl$cell.id, ploidy.annot$cell.id)]
+  # add to metadata
+  object.list[[s]] <- AddMetaData(object.list[[s]], pl$c1, col.name = "ploidy1")
+  object.list[[s]] <- AddMetaData(object.list[[s]], pl$c6, col.name = "ploidy6")
+  object.list[[s]] <- AddMetaData(object.list[[s]], pl$c8, col.name = "ploidy8")
+  object.list[[s]] <- AddMetaData(object.list[[s]], pl$c11, col.name = "ploidy11")
+  object.list[[s]] <- AddMetaData(object.list[[s]], pl$condensed, col.name = "all.ploidy")
+}
+
+# preview what this looks like in the meta data
+head(object.list[[1]]@meta.data)
+```
+
+```{r}
+data.filt2 <- AddMetaData(data.filt2, ploidy.annot$c1, col.name = "ploidy1")
+data.filt2 <- AddMetaData(data.filt2, ploidy.annot$c6, col.name = "ploidy6")
+data.filt2 <- AddMetaData(data.filt2, ploidy.annot$c8, col.name = "ploidy8")
+data.filt2 <- AddMetaData(data.filt2, ploidy.annot$c11, col.name = "ploidy11")
+data.filt2 <- AddMetaData(data.filt2, ploidy.annot$condensed, col.name = "all.ploidy")
+head(data.filt2@meta.data)
+```
+
+# Identify fold-change in gene expression from duplicated chromosomes
+```{r, results = "hold", results = "hide"}
+### extract expression data for individual cell line & log2 transform
+df <- data.filt2
+log_data <- GetAssayData(df@assays$RNA)
+log2_data <- log(expm1(log_data)+1, 2)
+l2df <- log2_data
+### setup necessary gene/chromosome info for CONICSmat analysis
+gene_pos <- filt.genes[filt.genes$gene_id %in% rownames(l2df), c(1:5)]
+colnames(gene_pos) <- c("ensembl_gene_id", "mgi_symbol", "chromosome_name", "start_position", "end_position")
+#### !!!only using chromosomes 1-8, 11-19 because chromosomes 9 & 10 cause issues (but do not accumulate aneuploidies anyway)
+regions2 <- regions[c(1, 6, 8, 11),]
+### filter expression data to only genes with position info & expressed in at least 5 cells
+l2df <- filterMatrix(l2df, gene_pos$ensembl_gene_id, minCells = 5)
+### calculate normalization factor
+normFactor <- calcNormFactors(l2df)
+### rename genes with gene symbols instead of ENSEMBL IDs
+l2df@Dimnames[[1]] <- annotations$gene_name[match(l2df@Dimnames[[1]], annotations$gene_id)]
+### analyze with mixed Gaussian model in CONICSmat
+l1 <- plotAll(l2df, normFactor, regions2, gene_pos, fname = "combined_1.pdf", normal = which(df@meta.data$ploidy1 == "0"), tumor = which(df@meta.data$ploidy1 == "1"))
+l6 <- plotAll(l2df, normFactor, regions2, gene_pos, fname = "combined_6.pdf", normal = which(df@meta.data$ploidy6 == "0"), tumor = which(df@meta.data$ploidy6 == "1"))
+l8 <- plotAll(l2df, normFactor, regions2, gene_pos, fname = "combined_8.pdf", normal = which(df@meta.data$ploidy8 == "0"), tumor = which(df@meta.data$ploidy8 == "1"))
+l11 <- plotAll(l2df, normFactor, regions2, gene_pos, fname = "combined_11.pdf", normal = which(df@meta.data$ploidy11 == "0"), tumor = which(df@meta.data$ploidy11 == "1"))
+```
+
+### Visualization & Calculation of Gene Expression Changes {.tabset .tabset-fade}
+#### Aneuploid Chromosomes
+```{r, results = "hold"}
+# display ploidy numbers
+print(paste0("Total cell count = ", ncol(df)))
+print(table(df@meta.data$line))
+print(paste0("Aneuploid Chr 1  = ", unname(table(df@meta.data$ploidy1)[2]), "  || Euploid Chr 1  = ", unname(table(df@meta.data$ploidy1)[1])))
+print(paste0("Aneuploid Chr 6  = ", unname(table(df@meta.data$ploidy6)[2]), "  || Euploid Chr 6  = ", unname(table(df@meta.data$ploidy6)[1])))
+print(paste0("Aneuploid Chr 8  = ", unname(table(df@meta.data$ploidy8)[2]), " || Euploid Chr 8  = ", unname(table(df@meta.data$ploidy8)[1])))
+print(paste0("Aneuploid Chr 11 = ", unname(table(df@meta.data$ploidy11)[2]), " || Euploid Chr 11 = ", unname(table(df@meta.data$ploidy11)[1])))
+```
+
+```{r, results = "hold", results = "hide"}
+# plot fold-change in aneuploid cells
+fc_1 <- detectBreakPoints(l2df, normal = which(df@meta.data$ploidy1 == "0"), tumor = which(df@meta.data$ploidy1 == "1"), windowsize=101, gene_pos=gene_pos, chr=1)
+text(x = length(fc_1)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_1), 2)), col = "red", font = 2)
+fc_6 <- detectBreakPoints(l2df, normal = which(df@meta.data$ploidy6 == "0"), tumor = which(df@meta.data$ploidy6 == "1"), windowsize=101, gene_pos=gene_pos, chr=6,)
+text(x = length(fc_6)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_6), 2)), col = "red", font = 2)
+fc_8 <- detectBreakPoints(l2df, normal = which(df@meta.data$ploidy8 == "0"), tumor = which(df@meta.data$ploidy8 == "1"), windowsize=101, gene_pos=gene_pos, chr=8)
+text(x = length(fc_8)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_8), 2)), col = "red", font = 2)
+fc_11 <- detectBreakPoints(l2df, normal = which(df@meta.data$ploidy11 == "0"), tumor = which(df@meta.data$ploidy11 == "1"), windowsize=101, gene_pos=gene_pos, chr=11)
+text(x = length(fc_11)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_11), 2)), col = "red", font = 2)
+```
+
+#### Select Euploid Chromosomes
+```{r, results = "hold"}
+print(paste0("Total cell count = ", ncol(df)))
+print(table(df@meta.data$line))
+print(paste0("Cells w/ 1+ aneuploidies = ", sum(table(df@meta.data$all.ploidy)[2:16]), " || Cells with completely euploid karyotype = ", sum(table(df@meta.data$all.ploidy)[1])))
+```
+
+```{r, results = "hold"}
+# plot fold-change in euploid cells
+fc_2 <- detectBreakPoints(l2df, normal = which(df@meta.data$all.ploidy == "0000"), tumor = which(df@meta.data$all.ploidy != "0000"), windowsize=101, gene_pos=gene_pos, chr=2)
+text(x = length(fc_2)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_2), 2)), col = "red", font = 2)
+fc_4 <- detectBreakPoints(l2df, normal = which(df@meta.data$all.ploidy == "0000"), tumor = which(df@meta.data$all.ploidy != "0000"), windowsize=101, gene_pos=gene_pos, chr=4)
+text(x = length(fc_4)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_4), 2)), col = "red", font = 2)
+fc_12 <- detectBreakPoints(l2df, normal = which(df@meta.data$all.ploidy == "0000"), tumor = which(df@meta.data$all.ploidy != "0000"), windowsize=101, gene_pos=gene_pos, chr=12)
+text(x = length(fc_12)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_12), 2)), col = "red", font = 2)
+fc_18 <- detectBreakPoints(l2df, normal = which(df@meta.data$all.ploidy == "0000"), tumor = which(df@meta.data$all.ploidy != "0000"), windowsize=101, gene_pos=gene_pos, chr=18)
+text(x = length(fc_18)/2, y = 2, labels = paste0("Median Fold-change in Duplicated Gene Expression = ", round(2^median(fc_18), 2)), col = "red", font = 2)
+```
+
+# Differential Gene Expression of Cells with Single Chromosome Trisomy
+### Perform DEA on 'Aneuploid [Chr n] Only' vs 'Completely Euploid' Cells
+```{r}
+# identify differentially expressed markers in cells with aneuploid chromosome 8 (compared to cells with NO aneuploidies for any chromosome)
+aneuploid8.de <- FindMarkers(df, ident.1 = colnames(df)[which(df@meta.data$all.ploidy == "0010")], ident.2 = colnames(df)[which(df@meta.data$all.ploidy == "0000")], logfc.threshold = -Inf, min.pct = -Inf, min.diff.pct = -Inf)
+# add columns for gene annotations
+aneuploid8.de$symbol <- annotations$gene_name[match(rownames(aneuploid8.de), annotations$gene_id)]
+aneuploid8.de$chr <- annotations$seq_name[match(rownames(aneuploid8.de), annotations$gene_id)]
+aneuploid8.de$biotype <- annotations$gene_biotype[match(rownames(aneuploid8.de), annotations$gene_id)]
+aneuploid8.de$axis.pt <- (annotations$gene_seq_end[match(rownames(aneuploid8.de), annotations$gene_id)] + annotations$gene_seq_start[match(rownames(aneuploid8.de), annotations$gene_id)])/2
+# add columns for points outside of the plot coordinates
+aneuploid8.de$p_val_adj2 <- ifelse(aneuploid8.de$p_val_adj == 0, 1e-300, aneuploid8.de$p_val_adj)
+aneuploid8.de$shape <- ifelse(aneuploid8.de$p_val_adj == 0, "o", "i")
+# add column for faceting
+aneuploid8.de$is8 <- ifelse(aneuploid8.de$chr == "8", "Duplicated", "Non-duplicated")
+# add column for FC sign
+aneuploid8.de$sign <- ifelse(sign(aneuploid8.de$avg_log2FC) == "1", "Up", "Down")
+aneuploid8.de$sign[which(aneuploid8.de$avg_log2FC == 0)] <- "None"
+# remove genes without annotations & from scaffolds
+aneuploid8.de <- aneuploid8.de[!is.na(aneuploid8.de$symbol),]
+aneuploid8.de <- aneuploid8.de[aneuploid8.de$chr %in% c(as.character(c(1:19)), "X", "Y", "MT"),]
+aneuploid8.de$chr <- factor(aneuploid8.de$chr, levels = c(as.character(c(1:19)), "X", "Y", "MT"))
+# only protein coding genes
+aneuploid8.de <- aneuploid8.de[which(aneuploid8.de$biotype == "protein_coding"),]
+# add gene ID column
+aneuploid8.de$id <- rownames(aneuploid8.de)
+###################################################################################################################################################################################################################################
+# identify differentially expressed markers in cells with aneuploid chromosome 8 (compared to cells with NO aneuploidies for any chromosome)
+aneuploid11.de <- FindMarkers(df, ident.1 = colnames(df)[which(df@meta.data$all.ploidy == "0001")], ident.2 = colnames(df)[which(df@meta.data$all.ploidy == "0000")], logfc.threshold = -Inf, min.pct = -Inf, min.diff.pct = -Inf)
+# add columns for gene annotations
+aneuploid11.de$symbol <- annotations$gene_name[match(rownames(aneuploid11.de), annotations$gene_id)]
+aneuploid11.de$chr <- annotations$seq_name[match(rownames(aneuploid11.de), annotations$gene_id)]
+aneuploid11.de$biotype <- annotations$gene_biotype[match(rownames(aneuploid11.de), annotations$gene_id)]
+aneuploid11.de$axis.pt <- (annotations$gene_seq_end[match(rownames(aneuploid11.de), annotations$gene_id)] + annotations$gene_seq_start[match(rownames(aneuploid11.de), annotations$gene_id)])/2
+# add columns for points outside of the plot coordinates
+aneuploid11.de$p_val_adj2 <- ifelse(aneuploid11.de$p_val_adj == 0, 1e-300, aneuploid11.de$p_val_adj)
+aneuploid11.de$shape <- ifelse(aneuploid11.de$p_val_adj == 0, "o", "i")
+# add column for faceting
+aneuploid11.de$is11 <- ifelse(aneuploid11.de$chr == "11", "Duplicated", "Non-duplicated")
+# add column for FC sign
+aneuploid11.de$sign <- ifelse(sign(aneuploid11.de$avg_log2FC) == "1", "Up", "Down")
+aneuploid11.de$sign[which(aneuploid11.de$avg_log2FC == 0)] <- "None"
+# remove genes without annotations & from scaffolds
+aneuploid11.de <- aneuploid11.de[!is.na(aneuploid11.de$symbol),]
+aneuploid11.de <- aneuploid11.de[aneuploid11.de$chr %in% c(as.character(c(1:19)), "X", "Y", "MT"),]
+aneuploid11.de$chr <- factor(aneuploid11.de$chr, levels = c(as.character(c(1:19)), "X", "Y", "MT"))
+# only protein coding genes
+aneuploid11.de <- aneuploid11.de[which(aneuploid11.de$biotype == "protein_coding"),]
+# add gene ID column
+aneuploid11.de$id <- rownames(aneuploid11.de)
+####################################################################################################################################
+# identify differentially expressed markers in cells with aneuploid chromosome 8 (compared to cells with NO aneuploidies for any chromosome)
+aneuploid1.de <- FindMarkers(df, ident.1 = colnames(df)[which(df@meta.data$all.ploidy == "1000")], ident.2 = colnames(df)[which(df@meta.data$all.ploidy == "0000")], logfc.threshold = -Inf, min.pct = -Inf, min.diff.pct = -Inf)
+# add columns for gene annotations
+aneuploid1.de$symbol <- annotations$gene_name[match(rownames(aneuploid1.de), annotations$gene_id)]
+aneuploid1.de$chr <- annotations$seq_name[match(rownames(aneuploid1.de), annotations$gene_id)]
+aneuploid1.de$biotype <- annotations$gene_biotype[match(rownames(aneuploid1.de), annotations$gene_id)]
+aneuploid1.de$axis.pt <- (annotations$gene_seq_end[match(rownames(aneuploid1.de), annotations$gene_id)] + annotations$gene_seq_start[match(rownames(aneuploid1.de), annotations$gene_id)])/2
+# add columns for points outside of the plot coordinates
+aneuploid1.de$p_val_adj2 <- ifelse(aneuploid1.de$p_val_adj == 0, 1e-300, aneuploid1.de$p_val_adj)
+aneuploid1.de$shape <- ifelse(aneuploid1.de$p_val_adj == 0, "o", "i")
+# add column for faceting
+aneuploid1.de$is1 <- ifelse(aneuploid1.de$chr == "1", "Duplicated", "Non-duplicated")
+# add column for FC sign
+aneuploid1.de$sign <- ifelse(sign(aneuploid1.de$avg_log2FC) == "1", "Up", "Down")
+aneuploid1.de$sign[which(aneuploid1.de$avg_log2FC == 0)] <- "None"
+# remove genes without annotations & from scaffolds
+aneuploid1.de <- aneuploid1.de[!is.na(aneuploid1.de$symbol),]
+aneuploid1.de <- aneuploid1.de[aneuploid1.de$chr %in% c(as.character(c(1:19)), "X", "Y", "MT"),]
+aneuploid1.de$chr <- factor(aneuploid1.de$chr, levels = c(as.character(c(1:19)), "X", "Y", "MT"))
+# only protein coding genes
+aneuploid1.de <- aneuploid1.de[which(aneuploid1.de$biotype == "protein_coding"),]
+# add gene ID column
+aneuploid1.de$id <- rownames(aneuploid1.de)
+###############################################################################################################################################
+# identify differentially expressed markers in cells with aneuploid chromosome 8 (compared to cells with NO aneuploidies for any chromosome)
+aneuploid6.de <- FindMarkers(df, ident.1 = colnames(df)[which(df@meta.data$all.ploidy == "0100")], ident.2 = colnames(df)[which(df@meta.data$all.ploidy == "0000")], logfc.threshold = -Inf, min.pct = -Inf, min.diff.pct = -Inf)
+# add columns for gene annotations
+aneuploid6.de$symbol <- annotations$gene_name[match(rownames(aneuploid6.de), annotations$gene_id)]
+aneuploid6.de$chr <- annotations$seq_name[match(rownames(aneuploid6.de), annotations$gene_id)]
+aneuploid6.de$biotype <- annotations$gene_biotype[match(rownames(aneuploid6.de), annotations$gene_id)]
+aneuploid6.de$axis.pt <- (annotations$gene_seq_end[match(rownames(aneuploid6.de), annotations$gene_id)] + annotations$gene_seq_start[match(rownames(aneuploid6.de), annotations$gene_id)])/2
+# add columns for points outside of the plot coordinates
+aneuploid6.de$p_val_adj2 <- ifelse(aneuploid6.de$p_val_adj == 0, 1e-300, aneuploid6.de$p_val_adj)
+aneuploid6.de$shape <- ifelse(aneuploid6.de$p_val_adj == 0, "o", "i")
+# add column for faceting
+aneuploid6.de$is6 <- ifelse(aneuploid6.de$chr == "6", "Duplicated", "Non-duplicated")
+# add column for FC sign
+aneuploid6.de$sign <- ifelse(sign(aneuploid6.de$avg_log2FC) == "1", "Up", "Down")
+aneuploid6.de$sign[which(aneuploid6.de$avg_log2FC == 0)] <- "None"
+# remove genes without annotations & from scaffolds
+aneuploid6.de <- aneuploid6.de[!is.na(aneuploid6.de$symbol),]
+aneuploid6.de <- aneuploid6.de[aneuploid6.de$chr %in% c(as.character(c(1:19)), "X", "Y", "MT"),]
+aneuploid6.de$chr <- factor(aneuploid6.de$chr, levels = c(as.character(c(1:19)), "X", "Y", "MT"))
+# only protein coding genes
+aneuploid6.de <- aneuploid6.de[which(aneuploid6.de$biotype == "protein_coding"),]
+# add gene ID column
+aneuploid6.de$id <- rownames(aneuploid6.de)
+```
+
+### Visualize the DE Genes
+#### Location
+```{r, results = "hold"}
+# show DE gene counts
+table(aneuploid8.de$sign[which(abs(aneuploid8.de$avg_log2FC) > 0.3)], aneuploid8.de$chr[which(abs(aneuploid8.de$avg_log2FC) > 0.3)])
+# show plot of no. of DE genes on each chromosome
+ggplot(aneuploid8.de[which(abs(aneuploid8.de$avg_log2FC) > 0.3),], aes(x = chr, y = sign, fill = chr)) +
+  theme_bw() +
+  geom_count(pch = 21) +
+  labs(title = "Number of DE Genes Per Chromosome (Trisomy 8)",
+       subtitle = "Log2 Fold-Change > |0.3|",
+       x = "Chromosome",
+       y = "Fold-Change Direction",
+       size = "Number of Genes") +
+  scale_fill_manual(breaks = levels(aneuploid8.de$chr),
+                     values = rainbow(22)) +
+  guides(fill = "none")
+######################################################################################################################################
+# show DE gene counts
+table(aneuploid11.de$sign[which(abs(aneuploid11.de$avg_log2FC) > 0.3)], aneuploid11.de$chr[which(abs(aneuploid11.de$avg_log2FC) > 0.3)])
+# show plot of no. of DE genes on each chromosome
+ggplot(aneuploid11.de[which(abs(aneuploid11.de$avg_log2FC) > 0.3),], aes(x = chr, y = sign, fill = chr)) +
+  theme_bw() +
+  geom_count(pch = 21) +
+  labs(title = "Number of DE Genes Per Chromosome (Trisomy 11)",
+       subtitle = "Log2 Fold-Change > |0.3|",
+       x = "Chromosome",
+       y = "Fold-Change Direction",
+       size = "Number of Genes") +
+  scale_fill_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  guides(fill = "none")
+######################################################################################################################################
+# show DE gene counts
+table(aneuploid6.de$sign[which(abs(aneuploid6.de$avg_log2FC) > 0.3)], aneuploid6.de$chr[which(abs(aneuploid6.de$avg_log2FC) > 0.3)])
+# show plot of no. of DE genes on each chromosome
+ggplot(aneuploid6.de[which(abs(aneuploid6.de$avg_log2FC) > 0.3),], aes(x = chr, y = sign, fill = chr)) +
+  theme_bw() +
+  geom_count(pch = 21) +
+  labs(title = "Number of DE Genes Per Chromosome (Trisomy 6)",
+       subtitle = "Log2 Fold-Change > |0.3|",
+       x = "Chromosome",
+       y = "Fold-Change Direction",
+       size = "Number of Genes") +
+  scale_fill_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  guides(fill = "none")
+#######################################################################################################################################
+# show DE gene counts
+table(aneuploid1.de$sign[which(abs(aneuploid1.de$avg_log2FC) > 0.3)], aneuploid1.de$chr[which(abs(aneuploid1.de$avg_log2FC) > 0.3)])
+# show plot of no. of DE genes on each chromosome
+ggplot(aneuploid1.de[which(abs(aneuploid1.de$avg_log2FC) > 0.3),], aes(x = chr, y = sign, fill = chr)) +
+  theme_bw() +
+  geom_count(pch = 21) +
+  labs(title = "Number of DE Genes Per Chromosome (Trisomy 1)",
+       subtitle = "Log2 Fold-Change > |0.3|",
+       x = "Chromosome",
+       y = "Fold-Change Direction",
+       size = "Number of Genes") +
+  scale_fill_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  guides(fill = "none")
+```
+
+#### Volcano (By Dup.)
+```{r, results = "hold"}
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid8.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_grid(cols = vars(is8)) +
+  scale_color_manual(breaks = levels(aneuploid8.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 8 Cells",
+       subtitle = "Duplicated (Chromosome 8 Genes) Genes",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+######################################################################################################
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid11.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_grid(cols = vars(is11)) +
+  scale_color_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 11 Cells",
+       subtitle = "Duplicated (Chromosome 11 Genes) Genes",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+######################################################################################################
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid1.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_grid(cols = vars(is1)) +
+  scale_color_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 1 Cells",
+       subtitle = "Duplicated (Chromosome 1 Genes) Genes",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+######################################################################################################
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid6.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_grid(cols = vars(is6)) +
+  scale_color_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 6 Cells",
+       subtitle = "Duplicated (Chromosome 6 Genes) Genes",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+```
+
+#### Volcano (By Chr)
+```{r, results = "hold"}
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid8.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_wrap(~chr) +
+  scale_color_manual(breaks = levels(aneuploid8.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 8 Cells",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(col = "none", shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+###################################################################################################
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid11.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_wrap(~chr) +
+  scale_color_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 11 Cells",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(col = "none", shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+###################################################################################################
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid1.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_wrap(~chr) +
+  scale_color_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 1 Cells",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(col = "none", shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+###################################################################################################
+# show volcano plots for duplicated genes & non-duplicated genes
+ggplot(aneuploid6.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_wrap(~chr) +
+  scale_color_manual(breaks = levels(aneuploid11.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid 6 Cells",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(col = "none", shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+```
+
+## Gene Set Enrichment Analysis
+### GO
+```{r, eval = F}
+# setup gene list
+gene_list <- aneuploid8.de$avg_log2FC
+names(gene_list) <- rownames(aneuploid8.de)
+gene_list <- sort(gene_list, decreasing = T)
+
+set.seed(123)
+gse <- gseGO(geneList = gene_list[which(abs(gene_list) > 0.3)],
+             ont = "BP", 
+             keyType = "ENSEMBL",
+             minGSSize = 10, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.1, 
+             verbose = TRUE, 
+             OrgDb = org.Mm.eg.db, 
+             pAdjustMethod = "none")
+dotplot(gse, showCategory=20, split=".sign") + facet_grid(.~.sign)
+```
+
+### Common Decrease in X-Linked Genes in Trisomic Samples
+#### DE Gene Proportions
+```{r}
+comp1 <- summaryBy(data = aneuploid1.de, avg_log2FC ~ chr, FUN = c(length, median, sd))
+comp6 <- summaryBy(data = aneuploid6.de, avg_log2FC ~ chr, FUN = c(length, median, sd))
+comp8 <- summaryBy(data = aneuploid8.de, avg_log2FC ~ chr, FUN = c(length, median, sd))
+comp11 <- summaryBy(data = aneuploid11.de, avg_log2FC ~ chr, FUN = c(length, median, sd))
+# chr 1
+t1 <- ggplot(aneuploid1.de[aneuploid1.de$chr %in% c(as.factor(1:19), "X"),], aes(x = avg_log2FC, y = chr, col = chr)) +
+  theme_classic() +
+  geom_quasirandom(size = 2, method = "quasirandom", width = 0.2, groupOnX = F, alpha = 0.2, col = "gray80") +
+  geom_boxplot(outlier.shape = NA, alpha = 0) +
+  scale_y_discrete(limits = rev) +
+  scale_color_manual(values = c("darkorchid", rep("black", 18), "#244D94")) +
+  labs(title = "Trisomy 1",
+       x = "Average log2 Fold-Change",
+       y = "Chromosome",
+       color = "Duplicated") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+t1b <- ggplot(fcratios.1[which(fcratios.1$Sign == "Up" & fcratios.1$Chr != "Y"),]) +
+  theme_classic() +
+  geom_vpline(aes(x = as.numeric(Gene.Perc), y = Chr, col = Chr)) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(limits = c(0,1),
+                     breaks = c(0,0.5,1.0)) +
+  scale_color_manual(values = c("darkorchid", rep("gray80", 18), "#244D94")) +
+  labs(title = "",
+       x = "% +log2FC",
+       y = "Chromosome") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+plot_grid(t1, t1b, ncol = 2, rel_widths = c(0.75, 0.25))
+# chr 6
+t6 <- ggplot(aneuploid6.de[aneuploid6.de$chr %in% c(as.factor(1:19), "X"),], aes(x = avg_log2FC, y = chr, col = chr)) +
+  theme_classic() +
+  geom_quasirandom(size = 2, method = "quasirandom", width = 0.2, groupOnX = F, alpha = 0.2, col = "gray80") +
+  geom_boxplot(outlier.shape = NA, alpha = 0) +
+  scale_y_discrete(limits = rev) +
+  scale_color_manual(values = c(rep("black", 5), "darkorchid", rep("black", 13), "#244D94")) +
+  labs(title = "Trisomy 6",
+       x = "Average log2 Fold-Change",
+       y = "Chromosome",
+       color = "Duplicated") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+t6b <- ggplot(fcratios.6[which(fcratios.6$Sign == "Up" & fcratios.6$Chr != "Y"),]) +
+  theme_classic() +
+  geom_vpline(aes(x = as.numeric(Gene.Perc), y = Chr, col = Chr)) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(limits = c(0,1),
+                     breaks = c(0,0.5,1.0)) +
+  scale_color_manual(values = c(rep("gray80", 5), "darkorchid", rep("gray80", 13), "#244D94")) +
+  labs(title = "",
+       x = "% +log2FC",
+       y = "Chromosome") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+plot_grid(t6, t6b, ncol = 2, rel_widths = c(0.75, 0.25))
+# chr 8
+t8 <- ggplot(aneuploid8.de[aneuploid8.de$chr %in% c(as.factor(1:19), "X"),], aes(x = avg_log2FC, y = chr, col = chr)) +
+  theme_classic() +
+  geom_quasirandom(size = 2, method = "quasirandom", width = 0.2, groupOnX = F, alpha = 0.2, col = "gray80") +
+  geom_boxplot(outlier.shape = NA, alpha = 0) +
+  scale_y_discrete(limits = rev) +
+  scale_color_manual(values = c(rep("black", 7), "darkorchid", rep("black", 11), "#244D94")) +
+  labs(title = "Trisomy 8",
+       x = "Average log2 Fold-Change",
+       y = "Chromosome",
+       color = "Duplicated") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+t8b <- ggplot(fcratios.8[which(fcratios.8$Sign == "Up" & fcratios.8$Chr != "Y"),]) +
+  theme_classic() +
+  geom_vpline(aes(x = as.numeric(Gene.Perc), y = Chr, col = Chr)) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(limits = c(0,1),
+                     breaks = c(0,0.5,1.0)) +
+  scale_color_manual(values = c(rep("gray80", 7), "darkorchid", rep("gray80", 11), "#244D94")) +
+  labs(title = "",
+       x = "% +log2FC",
+       y = "Chromosome") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+plot_grid(t8, t8b, ncol = 2, rel_widths = c(0.75, 0.25))
+# chr 11
+t11 <- ggplot(aneuploid11.de[aneuploid11.de$chr %in% c(as.factor(1:19), "X"),], aes(x = avg_log2FC, y = chr, col = chr)) +
+  theme_classic() +
+  geom_quasirandom(size = 2, method = "quasirandom", width = 0.2, groupOnX = F, alpha = 0.2, col = "gray80") +
+  geom_boxplot(outlier.shape = NA, alpha = 0) +
+  scale_y_discrete(limits = rev) +
+  scale_color_manual(values = c(rep("black", 10), "darkorchid", rep("black", 8), "#244D94")) +
+  labs(title = "Trisomy 11",
+       x = "Average log2 Fold-Change",
+       y = "Chromosome",
+       color = "Duplicated") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+t11b <- ggplot(fcratios.11[which(fcratios.11$Sign == "Up" & fcratios.11$Chr != "Y"),]) +
+  theme_classic() +
+  geom_vpline(aes(x = as.numeric(Gene.Perc), y = Chr, col = Chr)) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(limits = c(0,1),
+                     breaks = c(0,0.5,1.0)) +
+  scale_color_manual(values = c(rep("gray80", 10), "darkorchid", rep("gray80", 8), "#244D94")) +
+  labs(title = "",
+       x = "% +log2FC",
+       y = "Chromosome") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        strip.background = element_rect(colour = "black", fill = "gray70"),
+        strip.text = element_text(size = 22, face = "bold"))
+plot_grid(t11, t11b, ncol = 2, rel_widths = c(0.75, 0.25))
+```
+
+#### Common Downregulated Chr X Genes (by FC)
+```{r}
+# merge trisomy DE data
+merged.8.11de <- merge(aneuploid8.de, aneuploid11.de, by = c("id", "symbol", "chr", "biotype", "axis.pt"), suffixes = c("_8", "_11"))
+merged.6.8de <- merge(aneuploid6.de, aneuploid8.de, by = c("id", "symbol", "chr", "biotype", "axis.pt"), suffixes = c("_6", "_8"))
+merged.6.11de <- merge(aneuploid6.de, aneuploid11.de, by = c("id", "symbol", "chr", "biotype", "axis.pt"), suffixes = c("_6", "_11"))
+merged.allde <- merge(aneuploid1.de, aneuploid6.de, by = c("id", "symbol", "chr", "biotype", "axis.pt"), suffixes = c("_1", "_6"))
+merged.allde <- merge(merged.allde, aneuploid8.de, by = c("id", "symbol", "chr", "biotype", "axis.pt"))
+merged.allde <- merge(merged.allde, aneuploid11.de, by = c("id", "symbol", "chr", "biotype", "axis.pt"), suffixes = c("_8", "_11"))
+# isolate chr X genes & pare down
+chrx.8.11de <- merged.8.11de[which(merged.8.11de$chr == "X"), -c(12,13,21,22)]
+chrx.6.8de <- merged.6.8de[which(merged.6.8de$chr == "X"), -c(12,13,21,22)]
+chrx.6.11de <- merged.6.11de[which(merged.6.11de$chr == "X"), -c(12,13,21,22)]
+chrx.allde <- merged.allde[which(merged.6.11de$chr == "X"),  -c(12,13,21,22,30,31,39,40)]
+```
+
+```{r}
+plotfun <- function(x,y,...){
+    points(x,y, 
+           col = ifelse(x<0 & y<0, "red", ifelse(x>0 & y>0, "dodgerblue", "gray80"))) #plot them
+    abline(h = 0) #horizontal line
+    abline(v = 0) #vertical line
+    txt1 <- length(which(x<=0 & y>=0))
+    txt2 <- length(which(x>0 & y>0))
+    txt3 <- length(which(x<0 & y<0))
+    txt4 <- length(which(x>=0 & y<=0))
+    text(c(-1.8, 1.8, -1.8, 1.8), c(1.8, 1.8, -1.8, -1.8), c(txt1, txt2, txt3, txt4), col = c("black", "dodgerblue", "red", "black"), cex = 1.4, font = 2)
+}
+pairs(chrx.allde[,c(7,14,21,28)],
+      upper.panel = plotfun,
+      lower.panel = NULL,
+      labels = c("Aneuploid 1", "Aneuploid 6", "Aneuploid 8", "Aneuploid 11"),
+      xlim = c(-2,2),
+      ylim = c(-2,2))
+
+ggplot(chrx.allde) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC_6, y = avg_log2FC_6))
+
+ggpairs(chrx.allde, 
+        columns = c(7,14,21,28),
+        columnLabels = c("Trisomy 1", "Trisomy 6", "Trisomy 8", "Trisomy 11"),
+        diag = list(continuous = "blankDiag"),
+        lower = list(continuous = "cor"))
+```
+
+##### Common Downregulated Chr X Genes (by intersection)
+```{r, results = "hold"}
+# UpSet plot of 
+d.upsetinfo <- list("Down in Aneuploid 1" = chrx.allde$id[which(chrx.allde$sign_1 == "Down")], "Down in Aneuploid 6" = chrx.allde$id[which(chrx.allde$sign_6 == "Down")], "Down in Aneuploid 8" = chrx.allde$id[which(chrx.allde$sign_8 == "Down")], "Down in Aneuploid 11" = chrx.allde$id[which(chrx.allde$sign_11 == "Down")])
+d.upset <- upset(fromList(d.upsetinfo),
+                   sets = c("Down in Aneuploid 1", "Down in Aneuploid 6", "Down in Aneuploid 8", "Down in Aneuploid 11"),
+                   keep.order = T,
+                   main.bar.color = c(rep("gray50", 4), rep("gray40", 6), rep("gray30", 4), rep("black", 1)),
+                   sets.x.label = "Number of Genes in Category",
+                   mainbar.y.label = "Number of Downreg.\nGenes Shared",
+                   text.scale = c(1.5, 1, 1, 1.5, 1.2, 1.3),
+                   shade.color = "gray80")
+d.upset
+###################################################################################################################################################
+# UpSet plot of 
+u.upsetinfo <- list("Up in Aneuploid 1" = chrx.allde$id[which(chrx.allde$sign_1 == "Up")], "Up in Aneuploid 6" = chrx.allde$id[which(chrx.allde$sign_6 == "Up")], "Up in Aneuploid 8" = chrx.allde$id[which(chrx.allde$sign_8 == "Up")], "Up in Aneuploid 11" = chrx.allde$id[which(chrx.allde$sign_11 == "Up")])
+u.upset <- upset(fromList(u.upsetinfo),
+                   sets = c("Up in Aneuploid 1", "Up in Aneuploid 6", "Up in Aneuploid 8", "Up in Aneuploid 11"),
+                   keep.order = T,
+                   main.bar.color = c(rep("gray50", 4), rep("gray40", 6), rep("gray30", 4), rep("black", 1)),
+                   sets.x.label = "Number of Genes in Category",
+                   mainbar.y.label = "Number of Upreg.\nGenes Shared",
+                   text.scale = c(1.5, 1, 1, 1.5, 1.2, 1.3),
+                   shade.color = "gray80")
+u.upset
+```
+
+#### Significance level
+```{r}
+# create data to hold bootstrap data
+downx.bs <- data.frame(matrix(nrow = 50001, ncol = 2))
+colnames(downx.bs) <- c("Value", "allDown")
+downx.bs$Value <- c("observed", seq(1:50000))
+# add observed value in bootstrap data
+downx.bs[1,2] <- length(which(chrx.allde$sign_1 == "Down" & chrx.allde$sign_6 == "Down" & chrx.allde$sign_8 == "Down" & chrx.allde$sign_11 == "Down"))
+# perform bootstrapping
+for (i in 2:50001) {
+  tmp <- data.frame(matrix(nrow = 620, ncol = 5))
+  colnames(tmp) <- c("c1", "c6", "c8", "c11", "summary")
+  tmp$c1 <- sample(chrx.allde$sign_1)
+  tmp$c6 <- sample(chrx.allde$sign_6)
+  tmp$c8 <- sample(chrx.allde$sign_8)
+  tmp$c11 <- sample(chrx.allde$sign_11)
+  tmp2 <- ifelse(tmp[,1:4] == "Down", 1, 0)
+  tmp$summary <- rowSums(tmp2)
+  downx.bs[i,2] <- length(which(tmp$summary == 4))
+}
+# find p-value for 136 commonly downregulated Chr X genes
+pval <- length(which(downx.bs[,2] >= 136))/50001
+# calculate density distribution outside ggplot
+downx.density <- density(downx.bs[,2])
+downx.density <- data.frame("x" = downx.density$x, "y" = downx.density$y)
+# plot distribution
+ggplot(downx.density, aes(x, y)) +
+  theme_classic() +
+  geom_line(col = "black") +
+  annotate("segment", x = 136, xend = 136, y = 0, yend = 0.04, col = "red") +
+  annotate("text", x = 136, y = 0.045, label = "Observed Value:\n136", col = "red") +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(title = "Bootstrapping for Shared Downregulated Chr X Genes",
+       subtitle = paste0("20,000 independent samplings\np-value = ", format(pval, scientific = F)),
+       x = "Number of Genes Downregulated in All Single Trisomy Cells",
+       y = "Density")
+```
+
+## Plot changes in X-linked TSG expression
+```{r}
+chrx.allde$tsg <- "n"
+chrx.allde$tsg[which(chrx.allde$id %in% hTSGs$MouseID)] <- "y"
+
+############################
+
+aneuploida.de <- FindMarkers(df, ident.1 = colnames(df)[which(df@meta.data$all.ploidy != "0000")], ident.2 = colnames(df)[which(df@meta.data$all.ploidy == "0000")], logfc.threshold = -Inf, min.pct = -Inf, min.diff.pct = -Inf)
+# add columns for gene annotations
+aneuploida.de$symbol <- annotations$gene_name[match(rownames(aneuploida.de), annotations$gene_id)]
+aneuploida.de$chr <- annotations$seq_name[match(rownames(aneuploida.de), annotations$gene_id)]
+aneuploida.de$biotype <- annotations$gene_biotype[match(rownames(aneuploida.de), annotations$gene_id)]
+aneuploida.de$axis.pt <- (annotations$gene_seq_end[match(rownames(aneuploida.de), annotations$gene_id)] + annotations$gene_seq_start[match(rownames(aneuploida.de), annotations$gene_id)])/2
+# add columns for points outside of the plot coordinates
+aneuploida.de$p_val_adj2 <- ifelse(aneuploida.de$p_val_adj == 0, 1e-300, aneuploida.de$p_val_adj)
+aneuploida.de$shape <- ifelse(aneuploida.de$p_val_adj == 0, "o", "i")
+# add column for faceting
+aneuploida.de$isdup <- ifelse(aneuploida.de$chr %in% c("1", "6", "8", "11"), "Duplicated", "Non-duplicated")
+# add column for FC sign
+aneuploida.de$sign <- ifelse(sign(aneuploida.de$avg_log2FC) == "1", "Up", "Down")
+aneuploida.de$sign[which(aneuploida.de$avg_log2FC == 0)] <- "None"
+# remove genes without annotations & from scaffolds
+aneuploida.de <- aneuploida.de[!is.na(aneuploida.de$symbol),]
+aneuploida.de <- aneuploida.de[aneuploida.de$chr %in% c(as.character(c(1:19)), "X", "Y", "MT"),]
+aneuploida.de$chr <- factor(aneuploida.de$chr, levels = c(as.character(c(1:19)), "X", "Y", "MT"))
+# only protein coding genes
+aneuploida.de <- aneuploida.de[which(aneuploida.de$biotype == "protein_coding"),]
+# add gene ID column
+aneuploida.de$id <- rownames(aneuploida.de)
+
+ggplot(aneuploida.de) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = chr), alpha = 0.6) +
+  facet_wrap(~chr) +
+  scale_color_manual(breaks = levels(aneuploida.de$chr),
+                     values = rainbow(22)) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid Cells",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "Chromosome") +
+  guides(col = "none", shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+
+x <- aneuploida.de[aneuploida.de$chr == "X", c(2,5,6,9,14)]
+x$ds <- rep("all", 620)
+x1 <- aneuploid1.de[aneuploid1.de$chr == "X", c(2,5,6,9,14)]
+x1$ds <- rep("c1", 620)
+x6 <- aneuploid6.de[aneuploid6.de$chr == "X", c(2,5,6,9,14)]
+x6$ds <- rep("c6", 620)
+x8 <- aneuploid8.de[aneuploid8.de$chr == "X", c(2,5,6,9,14)]
+x8$ds <- rep("c8", 620)
+x11 <- aneuploid11.de[aneuploid11.de$chr == "X", c(2,5,6,9,14)]
+x11$ds <- rep("c11", 620)
+x$tsg <- ifelse(x$id %in% hTSGs$MouseID, "y", "n")
+x1$tsg <- ifelse(x1$id %in% hTSGs$MouseID, "y", "n")
+x6$tsg <- ifelse(x6$id %in% hTSGs$MouseID, "y", "n")
+x8$tsg <- ifelse(x8$id %in% hTSGs$MouseID, "y", "n")
+x11$tsg <- ifelse(x11$id %in% hTSGs$MouseID, "y", "n")
+chrx.allde$tsg <- ifelse(chrx.allde$id %in% hTSGs$MouseID, "y", "n")
+
+xall <- rbind(x, x1, x6, x8, x11)
+xall$ds <- factor(xall$ds, levels = c("all", "c1", "c6", "c8", "c11"))
+order <- xall[which(xall$ds == "all"),]
+order <- order[which(order$tsg == "y"),]
+order <- order$symbol[order(order$avg_log2FC)]
+
+ggplot(x) +
+  theme_bw() +
+  geom_point(aes(x = avg_log2FC, y = -log10(p_val_adj2), shape = shape, col = tsg, size = tsg), alpha = 0.6) +
+  scale_color_manual(values = c("black", "red")) +
+  coord_cartesian(xlim = c(-2,2), ylim = c(0,290)) +
+  labs(title = "Genes DE in Aneuploid Cells",
+       x = "Average log2 Fold-Change",
+       y = "-log10(adjusted p-value)",
+       col = "TSG") +
+  guides(col = "none", shape = "none") +
+  geom_vline(xintercept = c(-0.3, 0.3), lty = 2)
+
+ggplot(x[which(x$tsg == "y"),]) +
+  theme_bw() +
+  geom_point(aes(x = reorder(symbol, desc(avg_log2FC)), y = avg_log2FC, size = -log10(p_val_adj))) +
+  geom_hline(yintercept = 0) +
+  scale_size_continuous(range = c(1,10)) +
+  labs(y = "Log2 Fold Change",
+       x = "",
+       size = "-log10\nAdj p-val") +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12))
+
+plotfun <- function(x,y,...){
+  points(x,y, 
+         col = ifelse(x<0 & y<0, "#244D94", ifelse(x>0 & y>0, "#244D94", "gray80")),
+         cex = 1.5,
+         pch = 19) #plot them
+  abline(h = 0) #horizontal line
+  abline(v = 0) #vertical line
+  text(x-0.1, y-0.1, chrx.allde[which(chrx.allde$tsg == "y"),2])
+  txt1 <- length(which(x<=0 & y>=0))
+  txt2 <- length(which(x>0 & y>0))
+  txt3 <- length(which(x<0 & y<0))
+  txt4 <- length(which(x>=0 & y<=0))
+  text(c(-1.8, 1.8, -1.8, 1.8), c(1.8, 1.8, -1.8, -1.8), c(txt1, txt2, txt3, txt4), col = c("black", "dodgerblue", "red", "black"), cex = 1.4, font = 2)
+}
+pairs(chrx.allde[which(chrx.allde$tsg == "y"),c(7,14,21,28)],
+      upper.panel = plotfun,
+      lower.panel = NULL,
+      labels = c("Aneuploid 1", "Aneuploid 6", "Aneuploid 8", "Aneuploid 11"),
+      xlim = c(-1,1),
+      ylim = c(-1,1))
+
+ggplot(xall[which(xall$tsg == "y" & xall$ds != "all"),]) +
+  theme_bw() +
+  geom_point(aes(x = symbol, y = ds, col = -log10(p_val_adj), size = avg_log2FC)) +
+  scale_x_discrete(limits = order) +
+  scale_size_continuous(range = c(10,0))
+
+testa <-  ggplot(xall[which(xall$tsg == "y" & xall$ds == "all"),]) +
+  theme_bw() +
+  geom_point(aes(y = reorder(symbol, -avg_log2FC), x = avg_log2FC, size = -log10(p_val_adj))) +
+  geom_vline(xintercept = 0) +
+  scale_size_continuous(range = c(1,10)) +
+  labs(y = "Log2 Fold Change",
+       x = "",
+       size = "-log10\nAdj p-val") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12))
+
+test11 <-  ggplot(xall[which(xall$tsg == "y" & xall$ds == "c11"),]) +
+  theme_bw() +
+  geom_point(aes(x = symbol, y = avg_log2FC, size = -log10(p_val_adj))) +
+  geom_hline(yintercept = 0) +
+  scale_size_continuous(range = c(1,10)) +
+  scale_x_discrete(limits = order) +
+  labs(y = "Log2 Fold Change",
+       x = "",
+       size = "-log10\nAdj p-val") +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12))
+
+test1 <-  ggplot(xall[which(xall$tsg == "y" & xall$ds == "c1"),]) +
+  theme_bw() +
+  geom_point(aes(x = symbol, y = avg_log2FC, size = -log10(p_val_adj))) +
+  geom_hline(yintercept = 0) +
+  scale_size_continuous(range = c(1,10)) +
+  scale_x_discrete(limits = order) +
+  labs(y = "Log2 Fold Change",
+       x = "",
+       size = "-log10\nAdj p-val") +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12))
+
+test6 <-  ggplot(xall[which(xall$tsg == "y" & xall$ds == "c6"),]) +
+  theme_bw() +
+  geom_point(aes(x = symbol, y = avg_log2FC, size = -log10(p_val_adj))) +
+  geom_hline(yintercept = 0) +
+  scale_size_continuous(range = c(1,10)) +
+  scale_x_discrete(limits = order) +
+  labs(y = "Log2 Fold Change",
+       x = "",
+       size = "-log10\nAdj p-val") +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12))
+
+test8 <-  ggplot(xall[which(xall$tsg == "y" & xall$ds == "c8"),]) +
+  theme_bw() +
+  geom_point(aes(x = symbol, y = avg_log2FC, size = -log10(p_val_adj))) +
+  geom_hline(yintercept = 0) +
+  scale_size_continuous(range = c(1,10)) +
+  scale_x_discrete(limits = order) +
+  labs(y = "Log2 Fold Change",
+       x = "",
+       size = "-log10\nAdj p-val") +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12))
+
+plot_grid(testa, test1, test6, test8, test11, ncol = 1)
+```
+
+---
+
+# (3) Single-cell RNA-seq from isogenic mouse embryonic stem cells (C3H/HeSn-Paf/J)
+##### Load necessary libraries
+```{r, message = F}
+library(Matrix)
+library(readr)
+library(Seurat)
+library(dplyr)
+library(ggpubr)
+library(gplots)
+library(cowplot)
+library(ggridges)
+library(reshape2)
+library(miscTools)
+library(beanplot)
+library(mixtools)
+library(pheatmap)
+library(zoo)
+library(squash)
+library(biomaRt)
+library(devtools)
+library(Rtsne)
+library(scran)
+library(CONICSmat)
+library(UpSetR)
+library(AnnotationHub)
+library(clusterProfiler)
+library(DOSE)
+library(ungeviz)
+library(org.Mm.eg.db)
+library(GGally)
+library(ggplot2)
+library(ggbeeswarm)
+library(ensembldb)
+```
+##### Load necessary data
+Set working directory to the file containing the count matrix, feature list, and barcode lists.
+
+## EARLY TIMEPOINT CELL LINE DATA
+## Load in gene expression and LMO tag data + gene annotations
+```{r eval=FALSE, message=FALSE, include=FALSE}
+# load in sparse expression matrix for pool2
+## features are genes (labeled by symbol)
+## barcodes are cell IDs (ending with "-1")
+expression_matrix <- ReadMtx(mtx = "G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/matrix.mtx.gz",
+                             features = "G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/features.tsv.gz",
+                             cells = "G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/barcodes.tsv.gz")
+data_p0 <- CreateSeuratObject(counts = expression_matrix, min.cells = 3)
+rm(expression_matrix)
+
+# load gene annotations & append chr to list of expressed genes
+features_tsv <- read_delim("G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/features.tsv.gz",
+                           delim = "\t", escape_double = FALSE,
+                           col_names = FALSE, trim_ws = TRUE)
+genedata <- read_delim("G:/JAX/Code/MULTIseq/genedata.txt", 
+                       delim = "\t", escape_double = FALSE, 
+                       trim_ws = TRUE)
+features_tsv$chr <- genedata$`Chromosome/scaffold name`[match(features_tsv$X1, genedata$`Gene stable ID`)]
+```
+
+## Calculate additional QC metrics
+```{r}
+data_p0[["percent.mt"]] <- PercentageFeatureSet(data_p0, pattern = "^mt-")
+data_p0[["percent.ribo"]] <- PercentageFeatureSet(data_p0, pattern = "^Rp[sl]")
+```
+
+## QC
+### QC Inputs
+```{r}
+# Mitochondrial Read Percent
+mt.max <- 4
+mt.min <- 0.5
+# Read Count
+ct.max <- max(data_p0@meta.data$nCount_RNA)
+ct.min <- min(data_p0@meta.data$nCount_RNA)
+# Expressed Gene Count
+ft.max <- max(data@meta.data$nFeature_RNA)
+ft.min <- 4500
+```
+
+### Pre-QC Evaluation
+```{r}
+FeatureScatter(data_p0, feature1 = "nFeature_RNA", feature2 = "percent.mt", raster = F, col = "black") + NoLegend() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data_p0, feature1 = "nCount_RNA", feature2 = "percent.mt", raster = F, col = "black") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data_p0, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", raster = F, col = "black") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+
+ggplot() +
+  geom_histogram(aes(x = data_p0@meta.data$nFeature_RNA), binwidth = 100) +
+  theme_classic() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+```
+
+### Run filtering of raw data
+```{r}
+data.filt_p0 <- subset(data_p0, subset = percent.mt < mt.max & percent.mt > mt.min & nCount_RNA < ct.max & nCount_RNA > ct.min & nFeature_RNA < ft.max & nFeature_RNA > ft.min)
+```
+
+```{r}
+FeatureScatter(data.filt_p0, feature1 = "nFeature_RNA", feature2 = "percent.mt", raster = F, col = "dodgerblue") + NoLegend() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data.filt_p0, feature1 = "nCount_RNA", feature2 = "percent.mt", raster = F, col = "dodgerblue") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data.filt_p0, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", raster = F, col = "dodgerblue") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+
+ggplot() +
+  geom_histogram(aes(x = data.filt_p0@meta.data$nFeature_RNA), binwidth = 100, col = "dodgerblue") +
+  theme_classic() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+```
+
+```{r}
+DefaultAssay(data.filt_p0) <- "RNA"
+df_p0 <- NormalizeData(data.filt_p0, normalization.method = "LogNormalize", scale.factor = 1e6)
+df_p0 <- FindVariableFeatures(df_p0, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+df_p0 <- ScaleData(df_p0)
+```
+
+```{r}
+#
+cell_cycle_genes <- read_csv(url("https://raw.githubusercontent.com/hbc/tinyatlas/master/cell_cycle/Mus_musculus.csv"))
+# connect to AnnotationHub
+ah <- AnnotationHub()
+# access the Ensembl database for organism
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+# acquire the latest annotation files
+id <- ahDb %>%
+  mcols() %>%
+  rownames() %>%
+  tail(n = 1)
+# download the appropriate Ensembldb database
+edb <- ah[[id]]
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame")
+# select annotations of interest
+annotations <- annotations %>%
+  dplyr::select(gene_id, gene_name, seq_name, gene_seq_start, gene_seq_end, gene_biotype, description, seq_coord_system)
+# get gene names for Ensembl IDs for each gene
+cell_cycle_markers <- dplyr::left_join(cell_cycle_genes, annotations, by = c("geneID" = "gene_id"))
+# acquire the S phase genes
+s_genes <- cell_cycle_markers %>%
+  dplyr::filter(phase == "S") %>%
+  pull("gene_name")
+# acquire the G2M phase genes        
+g2m_genes <- cell_cycle_markers %>%
+  dplyr::filter(phase == "G2/M") %>%
+  pull("gene_name")
+```
+
+```{r}
+df_p0 <- CellCycleScoring(df_p0,
+                       g2m.features = g2m_genes,
+                       s.features = s_genes)
+df_p0$CC.Difference <- df_p0$S.Score - df_p0$G2M.Score
+df_p0 <- ScaleData(df_p0, vars.to.regress = "CC.Difference")
+```
+
+```{r}
+df_p0 <- RunPCA(df_p0, features = VariableFeatures(object = df_p0))
+df_p0 <- FindNeighbors(df_p0, dims = 1:20)
+df_p0 <- FindClusters(df_p0, resolution = 0.15)
+df_p0 <- RunTSNE(df_p0, reduction = "pca", dims = 1:30, perplexity = 100, max_iter = 1000,
+              theta = 0.5, eta = 200, num_threads = 0)
+df_p0 <- RunUMAP(df_p0, reduction = "pca", dims = 1:30, n.components = 2, n.neighbors = 30, n.epochs = 200, min.dist = 0.3, learning.rate = 1, spread = 1)
+tmp <- features_tsv[features_tsv$X2 %in% rownames(df_p0),]
+df_p0[["percent.x"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "X")])
+df_p0[["percent.y"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "Y")])
+df_p0[["percent.1"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "1")])
+df_p0[["percent.6"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "6")])
+df_p0[["percent.8"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "8")])
+df_p0[["percent.11"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "11")])
+df_p0[["percent.14"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "14")])
+df_p0[["percent.19"]] <- PercentageFeatureSet(df_p0, features = tmp$X2[which(tmp$chr == "19")])
+DimPlot(df_p0, reduction = "tsne")
+```
+
+## AGED TIMEPOINT CELL LINE DATA
+## Load in gene expression and LMO tag data + gene annotations
+```{r, message = F}
+# load in sparse expression matrix for pool2
+## features are genes (labeled by symbol)
+## barcodes are cell IDs (ending with "-1")
+expression_matrix <- ReadMtx(mtx = "G:/JAX/Code/MULTIseq/Pool2/filtered_feature_bc_matrix/matrix.mtx.gz",
+                             features = "G:/JAX/Code/MULTIseq/Pool2/filtered_feature_bc_matrix/features.tsv.gz",
+                             cells = "G:/JAX/Code/MULTIseq/Pool2/filtered_feature_bc_matrix/barcodes.tsv.gz")
+data_p10 <- CreateSeuratObject(counts = expression_matrix, min.cells = 3)
+rm(expression_matrix)
+
+# load gene annotations & append chr to list of expressed genes
+features_tsv <- read_delim("G:/JAX/Code/MULTIseq/pool1/filtered_feature_bc_matrix/features.tsv.gz",
+                           delim = "\t", escape_double = FALSE,
+                           col_names = FALSE, trim_ws = TRUE)
+genedata <- read_delim("G:/JAX/Code/MULTIseq/genedata.txt", 
+                       delim = "\t", escape_double = FALSE, 
+                       trim_ws = TRUE)
+features_tsv$chr <- genedata$`Chromosome/scaffold name`[match(features_tsv$X1, genedata$`Gene stable ID`)]
+```
+
+## Calculate additional QC metrics
+```{r}
+data_p10[["percent.mt"]] <- PercentageFeatureSet(data_p10, pattern = "^mt-")
+data_p10[["percent.ribo"]] <- PercentageFeatureSet(data_p10, pattern = "^Rp[sl]")
+```
+
+## QC
+### QC Inputs
+```{r}
+# Mitochondrial Read Percent
+mt.max <- 4
+mt.min <- 0.5
+# Read Count
+ct.max <- max(data_p10@meta.data$nCount_RNA)
+ct.min <- min(data_p10@meta.data$nCount_RNA)
+# Expressed Gene Count
+ft.max <- max(data_p10@meta.data$nFeature_RNA)
+ft.min <- 4000
+```
+
+### Pre-QC Evaluation
+```{r}
+FeatureScatter(data_p10, feature1 = "nFeature_RNA", feature2 = "percent.mt", raster = F, col = "black") + NoLegend() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data_p10, feature1 = "nCount_RNA", feature2 = "percent.mt", raster = F, col = "black") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data_p10, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", raster = F, col = "black") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+
+ggplot() +
+  geom_histogram(aes(x = data_p10@meta.data$nFeature_RNA), binwidth = 100) +
+  theme_classic() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+```
+
+### Run filtering of raw data
+```{r}
+data.filt_p10 <- subset(data_p10, subset = percent.mt < mt.max & percent.mt > mt.min & nCount_RNA < ct.max & nCount_RNA > ct.min & nFeature_RNA < ft.max & nFeature_RNA > ft.min)
+```
+
+```{r}
+FeatureScatter(data.filt_p10, feature1 = "nFeature_RNA", feature2 = "percent.mt", raster = F, col = "dodgerblue") + NoLegend() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data.filt_p10, feature1 = "nCount_RNA", feature2 = "percent.mt", raster = F, col = "dodgerblue") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(mt.min, mt.max), col = "red", size = 1.3)
+FeatureScatter(data.filt_p10, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", raster = F, col = "dodgerblue") + NoLegend() +
+  geom_vline(xintercept = c(ct.min, ct.max), col = "red", size = 1.3) +
+  geom_hline(yintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+
+ggplot() +
+  geom_histogram(aes(x = data.filt_p10@meta.data$nFeature_RNA), binwidth = 100, col = "dodgerblue") +
+  theme_classic() +
+  geom_vline(xintercept = c(ft.min, ft.max), col = "red", size = 1.3)
+```
+
+```{r}
+DefaultAssay(data.filt_p10) <- "RNA"
+df_p10 <- NormalizeData(data.filt_p10, normalization.method = "LogNormalize", scale.factor = 1e6)
+df_p10 <- FindVariableFeatures(df_p10, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+df_p10 <- ScaleData(df_p10)
+```
+
+```{r}
+df_p10 <- CellCycleScoring(df_p10,
+                       g2m.features = g2m_genes,
+                       s.features = s_genes)
+df_p10$CC.Difference <- df_p10$S.Score - df$G2M.Score
+df_p10 <- ScaleData(df_p10, vars.to.regress = "CC.Difference")
+```
+
+```{r}
+df_p10 <- RunPCA(df_p10, features = VariableFeatures(object = df_p10))
+df_p10 <- FindNeighbors(df_p10, dims = 1:20)
+df_p10 <- FindClusters(df_p10, resolution = 0.12)
+df_p10 <- RunTSNE(df_p10, reduction = "pca", dims = 1:30, perplexity = 100, max_iter = 1000,
+              theta = 0.5, eta = 200, num_threads = 0)
+df_p10 <- RunUMAP(df_p10, reduction = "pca", dims = 1:30, n.components = 2, n.neighbors = 30, n.epochs = 200, min.dist = 0.3, learning.rate = 1, spread = 1)
+tmp <- features_tsv[features_tsv$X2 %in% rownames(df_p10),]
+df_p10[["percent.x"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "X")])
+df_p10[["percent.y"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "Y")])
+df_p10[["percent.1"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "1")])
+df_p10[["percent.6"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "6")])
+df_p10[["percent.8"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "8")])
+df_p10[["percent.11"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "11")])
+df_p10[["percent.14"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "14")])
+df_p10[["percent.19"]] <- PercentageFeatureSet(df_p10, features = tmp$X2[which(tmp$chr == "19")])
+DimPlot(df_p10, reduction = "tsne")
+```
+
+## Identify XX, XY, and XO clusters based on expression of biased markers
+```{r}
+# check naive vs primed state of clusters
+## colors for clusters:
+clcol <- c('#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#ffff33','#a65628','#f781bf','#999999')
+## early
+pps1 <- DoHeatmap(df_p0,
+                 cells = which(df_p0$seurat_clusters %in% c(as.character(0:4))),
+                 group.colors = clcol,
+                 group.bar.height = 0.01,
+                 label = F,
+                 angle = 0,
+                 raster = F,
+                 features = c("Nanog", "Klf5", "Dppa3", # pluripotency markers
+                              "Klf2", "Klf4", "Nr0b1", "Fgf4", "Zfp42", # naive markers
+                              "Hormad1", "Xlr3a", "Xlr3c", "Dusp9", #XX-biased genes
+                              "Fgf5", "T", "Dnmt3b", "Pou3f1", "Otx2", "Sox3" # primed markers
+                 )) +
+  scale_fill_gradientn(colors = c("blue", "white", "red"), na.value = "white") +
+  guides(col = "none")
+
+xperc1 <- VlnPlot(df_p0,
+                  cols = clcol,
+                  pt.size = 0,
+                  features = "percent.x")
+
+toti1 <- VlnPlot(df_p0,
+                cols = clcol,
+                pt.size = 0,
+                features = c("Zscan4c", "Zscan4d"))
+
+mef1 <- VlnPlot(df_p0,
+                cols = clcol,
+                pt.size = 0,
+                features = c("Thy1", "Gata6"))
+
+## aged
+pps2 <- DoHeatmap(df_p10,
+                  cells = which(df2$seurat_clusters %in% c(as.character(0:2))),
+                  group.colors = clcol,
+                  group.bar.height = 0.01,
+                  label = F,
+                  angle = 0,
+                  raster = F,
+                  features = c("Nanog", "Klf5", "Dppa3", # pluripotency markers
+                               "Klf2", "Klf4", "Nr0b1", "Fgf4", "Zfp42", # naive markers
+                               "Hormad1", "Xlr3a", "Xlr3c", "Dusp9", #XX-biased genes
+                               "Fgf5", "T", "Dnmt3b", "Pou3f1", "Otx2", "Sox3" # primed markers
+                  )) +
+  scale_fill_gradientn(colors = c("blue", "white", "red"), na.value = "white") +
+  guides(col = "none")
+
+xperc2 <- VlnPlot(df_p10,
+                  cols = clcol,
+                  pt.size = 0,
+                  features = "percent.x")
+
+toti2 <- VlnPlot(df_p10,
+                cols = clcol,
+                pt.size = 0,
+                features = c("Zscan4c", "Zscan4d"))
+
+mef2 <- VlnPlot(df_p10,
+                cols = clcol,
+                pt.size = 0,
+                features = c("Thy1", "Gata6"))
+```
+
+### Identify cell cycle proportions in putative MEF clusters
+```{r}
+cc1 <- data.frame("timepoint" = ifelse(df_p0$orig.ident == "Pool1", "Early", "Aged"), "phase" = df_p0$Phase, "cluster" = df_p0$seurat_clusters)
+cc1.mef <- cc1[which(cc1$cluster == "6"),]
+cc2 <- data.frame("timepoint" = ifelse(df_p10$orig.ident == "Pool1", "Early", "Aged"), "phase" = df_p10$Phase, "cluster" = df_p10$seurat_clusters)
+cc2.mef <- cc2[which(cc2$cluster == "3"),]
+cctot <- data.frame(rbind(cc1,cc2))
+cctot.mef <- data.frame(rbind(cc1.mef,cc2.mef))
+ggplot(cctot.mef, aes(x = timepoint, fill = phase)) +
+  theme_classic() +
+  geom_bar(position = "fill", col = "black") +
+  #facet_wrap(~factor(timepoint, levels = c("Early", "Aged"))) +
+  scale_fill_grey() +
+  scale_x_discrete(limits = rev, labels = c("Early 6", "Aged 3")) +
+  labs(x = "Cluster",
+       y = "Proportion of Group",
+       fill = "CC Phase") +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        axis.title = element_text(size = 10),
+        axis.text.x = element_text(size = 9, face = "bold"),
+        axis.text.y = element_text(size = 9),
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        strip.background = element_rect(fill = "gray80"),
+        strip.text = element_text(size = 10, face = "bold"))
+```
+
+## Aneuploid cell identification
+### EARLY
+```{r}
+# separated by cell lines
+object.list_p0 <- SplitObject(df, split.by = "seurat_clusters")
+#for (s in c(1:12)) {
+#  object.list[[s]] <- NormalizeData(object.list[[s]], normalization.method = "LogNormalize", scale.factor = 1e6)
+#}
+
+# identify aneuploid cells (90%+ probability of component 2)
+## create lists to collect posterior probabilities & component assignments
+### generate list of posterior probabilities for component 2
+an.cells_p0 <- list()
+## subset genes from chromosomes 1-19
+filt.genes_p0 <- annotations[annotations$seq_name %in% c(1:19),]
+## construct chromosome size/position table for CONICSmat
+regions <- cbind("Chrom" = c(1:19), "Start" = rep(0,19), "End" = chr.lengths[c(1:19)], "Lengths" = chr.lengths[c(1:19)])
+## process each Seurat object for CONICSmat, run CONICSmat on each sample, then identify aneuploid cells in commonly aneuploid chromosomes
+setwd("G:/JAX/Code/MULTIseq/pool1_conicsmat")
+## annotations based on geneset expression above
+names(object.list_p0) <- c("2", "4", "xx", "xo", "xy", "5", "mef", "toti", "8")
+
+for (s in c(1,2,3)) {
+  n <- c("xx", "xy", "xo")[s]
+  i <- which(names(object.list_p0) == s)
+  ### extract expression data for individual cell line & log2 transform
+  df <- object.list_p0[[n]]
+  log_data <- GetAssayData(df@assays$RNA)
+  log2_data <- log(expm1(log_data)+1, 2)
+  l2df <- log2_data
+  ### setup necessary gene/chromosome info for CONICSmat analysis
+  gene_pos <- filt.genes_p0[filt.genes_p0$gene_name %in% rownames(l2df), c(1:5)]
+  colnames(gene_pos) <- c("ensembl_gene_id", "mgi_symbol", "chromosome_name", "start_position", "end_position")
+  #### !!!only using chromosomes 1-8, 11-19 because chromosomes 9 & 10 cause issues (but do not accumulate aneuploidies anyway)
+  regions2 <- regions[c(1:19),]
+  ### filter expression data to only genes with position info & expressed in at least 5 cells
+  l2df <- filterMatrix(l2df, gene_pos$mgi_symbol, minCells = 5)
+  ### calculate normalization factor
+  normFactor <- calcNormFactors(l2df)
+  ### rename genes with gene symbols instead of ENSEMBL IDs
+  #l2df@Dimnames[[1]] <- annotations$gene_name[match(l2df@Dimnames[[1]], annotations$gene_id)]
+  ### analyze with mixed Gaussian model in CONICSmat
+  l <- plotAll(l2df, normFactor, regions2, gene_pos, n)
+  ### subset only chromosomes 1, 6, 8, and 11 (commonly accumulating aneuploid chromosomes)
+  l2 <- l[,c(1,6,8,11, 14, 19)]
+  an.cells_p0[[n]] <- l2
+}
+```
+
+```{r}
+an.cells.id_p0 <- an.cells_p0
+# XX
+an.cells.id_p0[["xx"]][,1] <- ifelse(an.cells.id_p0[["xx"]][,1] < 0.95, 0, 1)
+an.cells.id_p0[["xx"]][,2] <- ifelse(an.cells.id_p0[["xx"]][,2] > 0.05, 0, 1)
+an.cells.id_p0[["xx"]][,3] <- ifelse(an.cells.id_p0[["xx"]][,3] < 0.95, 0, 1)
+an.cells.id_p0[["xx"]][,4] <- ifelse(an.cells.id_p0[["xx"]][,4] < 0.95, 0, 1)
+an.cells.id_p0[["xx"]][,5] <- ifelse(an.cells.id_p0[["xx"]][,5] < 0.95, 0, 1)
+an.cells.id_p0[["xx"]][,6] <- ifelse(an.cells.id_p0[["xx"]][,6] > 0.05, 0, 1)
+
+# XY
+an.cells.id_p0[["xy"]][,1] <- ifelse(an.cells.id_p0[["xy"]][,1] < 0.95, 0, 1)
+an.cells.id_p0[["xy"]][,2] <- ifelse(an.cells.id_p0[["xy"]][,2] < 0.95, 0, 1)
+an.cells.id_p0[["xy"]][,3] <- ifelse(an.cells.id_p0[["xy"]][,3] < 0.95, 0, 1)
+an.cells.id_p0[["xy"]][,4] <- ifelse(an.cells.id_p0[["xy"]][,4] < 0.95, 0, 1)
+an.cells.id_p0[["xy"]][,5] <- ifelse(an.cells.id_p0[["xy"]][,5] < 0.95, 0, 1)
+an.cells.id_p0[["xy"]][,6] <- ifelse(an.cells.id_p0[["xy"]][,6] < 0.95, 0, 1)
+
+# XO
+an.cells.id_p0[["xo"]][,1] <- ifelse(an.cells.id_p0[["xo"]][,1] < 0.95, 0, 1)
+an.cells.id_p0[["xo"]][,2] <- ifelse(an.cells.id_p0[["xo"]][,2] < 0.95, 0, 1)
+an.cells.id_p0[["xo"]][,3] <- ifelse(an.cells.id_p0[["xo"]][,3] < 0.95, 0, 1)
+an.cells.id_p0[["xo"]][,4] <- ifelse(an.cells.id_p0[["xo"]][,4] < 0.95, 0, 1)
+an.cells.id_p0[["xo"]][,5] <- ifelse(an.cells.id_p0[["xo"]][,5] < 0.95, 0, 1)
+an.cells.id_p0[["xo"]][,6] <- ifelse(an.cells.id_p0[["xo"]][,6] < 0.95, 0, 1)
+```
+
+```{r}
+ploidy.annot_p0 <- as.data.frame(matrix(nrow = nrow(an.cells.id_p0[["xx"]])+nrow(an.cells.id_p0[["xy"]])+nrow(an.cells.id_p0[["xo"]]), ncol = 8))
+colnames(ploidy.annot_p0) <- c("cell.id", "c1", "c6", "c8", "c11", "c14", "c19", "condensed")
+## populate with cell ids
+ploidy.annot_p0$cell.id <- c(rownames(an.cells.id_p0[["xx"]]), rownames(an.cells.id_p0[["xy"]]), rownames(an.cells.id_p0[["xo"]]))
+## add corresponding chromosome 1, 6, 8, and 11 ploidy annotations to data.frame
+temp <- rbind(an.cells.id_p0[["xx"]], an.cells.id_p0[["xy"]], an.cells.id_p0[["xo"]])
+for (r in c(1:nrow(ploidy.annot_p0))) {
+  ploidy.annot_p0[r,c(2:7)] <- temp[match(ploidy.annot_p0$cell.id[r], rownames(temp)),c(1:6)]
+}
+for (r in c(1:nrow(ploidy.annot_p0))) {
+  ploidy.annot_p0[r,8] <- ifelse(is.na(ploidy.annot_p0[r,2]), NA, paste0(ploidy.annot_p0[r,2], ploidy.annot_p0[r,3], ploidy.annot_p0[r,4], ploidy.annot_p0[r,5], ploidy.annot_p0[r,6], ploidy.annot_p0[r,7]))
+}
+rm(temp)
+```
+
+```{r}
+upsetinfo_p0 <- list(Euploid = which(ploidy.annot_p0$condensed == "000000"), Chr1=which(ploidy.annot_p0$c1 == 1), Chr6=which(ploidy.annot_p0$c6 == 1), Chr8=which(ploidy.annot_p0$c8 == 1), Chr11=which(ploidy.annot_p0$c11 == 1), Chr14=which(ploidy.annot_p0$c14 == 1), Chr19=which(ploidy.annot_p0$c19 == 1))
+upset_p0 <- upset(fromList(upsetinfo_p0),
+                   sets = c("Chr19", "Chr14", "Chr11", "Chr8", "Chr6", "Chr1", "Euploid"),
+                   keep.order = T,
+                   empty.intersections = "on",
+                   #main.bar.color = c(rep("gray70", 1), rep("darkorchid", 30)),
+                   sets.x.label = "Number of Lines in Category",
+                   mainbar.y.label = "Number of mESC Cells with\nSpecific Ploidy State",
+                   text.scale = c(1.5, 1, 1, 1.5, 1.2, 1.3),
+                   shade.color = "gray80")
+upset_p0
+```
+
+### AGED
+```{r}
+# separated by cell lines
+object.list_p10 <- SplitObject(df_p10, split.by = "seurat_clusters")
+#for (s in c(1:12)) {
+#  object.list[[s]] <- NormalizeData(object.list[[s]], normalization.method = "LogNormalize", scale.factor = 1e6)
+#}
+
+# identify aneuploid cells (90%+ probability of component 2)
+## create lists to collect posterior probabilities & component assignments
+### generate list of posterior probabilities for component 2
+an.cells_p10 <- list()
+## subset genes from chromosomes 1-19
+filt.genes_p10 <- annotations[annotations$seq_name %in% c(1:19),]
+## construct chromosome size/position table for CONICSmat
+regions <- cbind("Chrom" = c(1:19), "Start" = rep(0,19), "End" = chr.lengths[c(1:19)], "Lengths" = chr.lengths[c(1:19)])
+## process each Seurat object for CONICSmat, run CONICSmat on each sample, then identify aneuploid cells in commonly aneuploid chromosomes
+## annotations based on geneset expression above
+names(object.list_p10) <- c("xx", "xy", "xo", "4", "mef", "toti")
+
+for (s in c(1,2,3)) {
+  n <- c("xx", "xy", "xo")[s]
+  i <- which(names(object.list_p10) == s)
+  ### extract expression data for individual cell line & log2 transform
+  df <- object.list_p10[[n]]
+  log_data <- GetAssayData(df@assays$RNA)
+  log2_data <- log(expm1(log_data)+1, 2)
+  l2df <- log2_data
+  ### setup necessary gene/chromosome info for CONICSmat analysis
+  gene_pos <- filt.genes_p10[filt.genes_p10$gene_name %in% rownames(l2df), c(1:5)]
+  colnames(gene_pos) <- c("ensembl_gene_id", "mgi_symbol", "chromosome_name", "start_position", "end_position")
+  #### !!!only using chromosomes 1-8, 11-19 because chromosomes 9 & 10 cause issues (but do not accumulate aneuploidies anyway)
+  regions2 <- regions[c(1:19),]
+  ### filter expression data to only genes with position info & expressed in at least 5 cells
+  l2df <- filterMatrix(l2df, gene_pos$mgi_symbol, minCells = 5)
+  ### calculate normalization factor
+  normFactor <- calcNormFactors(l2df)
+  ### rename genes with gene symbols instead of ENSEMBL IDs
+  #l2df@Dimnames[[1]] <- annotations$gene_name[match(l2df@Dimnames[[1]], annotations$gene_id)]
+  ### analyze with mixed Gaussian model in CONICSmat
+  l <- plotAll(l2df, normFactor, regions2, gene_pos, n)
+  ### subset only chromosomes 1, 6, 8, and 11 (commonly accumulating aneuploid chromosomes)
+  l2 <- l[,c(1,6,8,11,14,19)]
+  an.cells_p10[[n]] <- l2
+}
+```
+
+```{r}
+an.cells.id_p10 <- an.cells_p10
+# XX
+an.cells.id_p10[["xx"]][,1] <- ifelse(an.cells.id_p10[["xx"]][,1] < 0.95, 0, 1)
+an.cells.id_p10[["xx"]][,2] <- ifelse(an.cells.id_p10[["xx"]][,2] < 0.95, 0, 1)
+an.cells.id_p10[["xx"]][,3] <- ifelse(an.cells.id_p10[["xx"]][,3] < 0.95, 0, 1)
+an.cells.id_p10[["xx"]][,4] <- ifelse(an.cells.id_p10[["xx"]][,4] < 0.95, 0, 1)
+an.cells.id_p10[["xx"]][,5] <- ifelse(an.cells.id_p10[["xx"]][,5] < 0.95, 0, 1)
+an.cells.id_p10[["xx"]][,6] <- ifelse(an.cells.id_p10[["xx"]][,6] < 0.95, 0, 1)
+# XY
+an.cells.id_p10[["xy"]][,1] <- ifelse(an.cells.id_p10[["xy"]][,1] < 0.95, 0, 1)
+an.cells.id_p10[["xy"]][,2] <- ifelse(an.cells.id_p10[["xy"]][,2] < 0.95, 0, 1)
+an.cells.id_p10[["xy"]][,3] <- ifelse(an.cells.id_p10[["xy"]][,3] < 0.95, 0, 1)
+an.cells.id_p10[["xy"]][,4] <- ifelse(an.cells.id_p10[["xy"]][,4] < 0.95, 0, 1)
+an.cells.id_p10[["xy"]][,5] <- ifelse(an.cells.id_p10[["xy"]][,5] < 0.95, 0, 1)
+an.cells.id_p10[["xy"]][,6] <- ifelse(an.cells.id_p10[["xy"]][,6] < 0.95, 0, 1)
+# XO
+an.cells.id_p10[["xo"]][,1] <- ifelse(an.cells.id_p10[["xo"]][,1] < 0.95, 0, 1)
+an.cells.id_p10[["xo"]][,2] <- ifelse(an.cells.id_p10[["xo"]][,2] < 0.95, 0, 1)
+an.cells.id_p10[["xo"]][,3] <- ifelse(an.cells.id_p10[["xo"]][,3] < 0.95, 0, 1)
+an.cells.id_p10[["xo"]][,4] <- ifelse(an.cells.id_p10[["xo"]][,4] < 0.95, 0, 1)
+an.cells.id_p10[["xo"]][,5] <- ifelse(an.cells.id_p10[["xo"]][,5] < 0.95, 0, 1)
+an.cells.id_p10[["xo"]][,6] <- ifelse(an.cells.id_p10[["xo"]][,6] < 0.95, 0, 1)
+```
+
+```{r}
+ploidy.annot_p10 <- as.data.frame(matrix(nrow = nrow(an.cells.id_p10[["xx"]])+nrow(an.cells.id_p10[["xy"]])+nrow(an.cells.id_p10[["xo"]]), ncol = 8))
+colnames(ploidy.annot_p10) <- c("cell.id", "c1", "c6", "c8", "c11", "c14", "c19", "condensed")
+## populate with cell ids
+ploidy.annot_p10$cell.id <- c(rownames(an.cells.id_p10[["xx"]]), rownames(an.cells.id_p10[["xy"]]), rownames(an.cells.id_p10[["xo"]]))
+## add corresponding chromosome 1, 6, 8, and 11 ploidy annotations to data.frame
+temp <- rbind(an.cells.id_p10[["xx"]], an.cells.id_p10[["xy"]], an.cells.id_p10[["xo"]])
+for (r in c(1:nrow(ploidy.annot_p10))) {
+  ploidy.annot_p10[r,c(2:7)] <- temp[match(ploidy.annot_p10$cell.id[r], rownames(temp)),c(1:6)]
+}
+for (r in c(1:nrow(ploidy.annot_p10))) {
+  ploidy.annot_p10[r,8] <- ifelse(is.na(ploidy.annot_p10[r,2]), NA, paste0(ploidy.annot_p10[r,2], ploidy.annot_p10[r,3], ploidy.annot_p10[r,4], ploidy.annot_p10[r,5], ploidy.annot_p10[r,6], ploidy.annot_p10[r,7]))
+}
+rm(temp)
+```
+
+```{r}
+upsetinfo <- list(Euploid = which(ploidy.annot_p10$condensed == "000000"), Chr1=which(ploidy.annot_p10$c1 == 1), Chr6=which(ploidy.annot_p10$c6 == 1), Chr8=which(ploidy.annot_p10$c8 == 1), Chr11=which(ploidy.annot_p10$c11 == 1), Chr14=which(ploidy.annot_p10$c14 == 1), Chr19=which(ploidy.annot_p10$c19 == 1))
+upset <- upset(fromList(upsetinfo),
+                   sets = c("Chr19", "Chr14", "Chr11", "Chr8", "Chr6", "Chr1", "Euploid"),
+                   keep.order = T,
+                   main.bar.color = c(rep("darkorchid", 1), rep("gray70", 1), rep("darkorchid", 48)),
+                   sets.x.label = "Number of Lines in Category",
+                   mainbar.y.label = "Number of mESC Cells with\nSpecific Ploidy State",
+                   text.scale = c(1.5, 1, 1, 1.5, 1.2, 1.3),
+                   shade.color = "gray80")
+upset
+```
+
+## COMBINED ANALYSES
+```{r}
+ploidy.comp <- as.data.frame(matrix(nrow = 42, ncol = 6))
+colnames(ploidy.comp) <- c("Time", "Sex", "Chr", "Total", "Aneuploid", "an.perc")
+ploidy.comp[,1] <- c(rep(0, 21), rep(10, 21))
+ploidy.comp[,2] <- c(rep("XX", 7), rep("XY", 7), rep("XO", 7), rep("XX", 7), rep("XY", 7), rep("XO", 7))
+ploidy.comp[,3] <- rep(c("total",1,6,8,11,14,19), 6)
+
+xx.0 <- rownames(an.cells.id_p0[["xx"]])
+xx.10 <- rownames(an.cells.id_p10[["xx"]])
+xy.0 <- rownames(an.cells.id_p0[["xy"]])
+xy.10 <- rownames(an.cells.id_p10[["xy"]])
+xo.0 <- rownames(an.cells.id_p0[["xo"]])
+xo.10 <- rownames(an.cells.id_p10[["xo"]])
+
+ploidy.annot_p0$sex <- NA
+ploidy.annot_p0$sex[ploidy.annot_p0$cell.id %in% xx.0] <- "xx.0"
+ploidy.annot_p0$sex[ploidy.annot_p0$cell.id %in% xy.0] <- "xy.0"
+ploidy.annot_p0$sex[ploidy.annot_p0$cell.id %in% xo.0] <- "xo.0"
+ploidy.annot_p10$sex <- NA
+ploidy.annot_p10$sex[ploidy.annot_p10$cell.id %in% xx.10] <- "xx.10"
+ploidy.annot_p10$sex[ploidy.annot_p10$cell.id %in% xy.10] <- "xy.10"
+ploidy.annot_p10$sex[ploidy.annot_p10$cell.id %in% xo.10] <- "xo.10"
+ploidy.annot_p0$t <- "0"
+ploidy.annot_p10$t <- "+10"
+
+ploidy.annot <- rbind(ploidy.annot_p0, ploidy.annot_p10)
+ploidy.comp[1:7,4] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xx.0"),])
+ploidy.comp[8:14,4] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xy.0"),])
+ploidy.comp[15:21,4] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xo.0"),])
+ploidy.comp[22:28,4] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xx.10"),])
+ploidy.comp[29:35,4] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xy.10"),])
+ploidy.comp[36:42,4] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xo.10"),])
+ploidy.comp[2:7,5] <- colSums(ploidy.annot[which(ploidy.annot$sex == "xx.0"),2:7])
+ploidy.comp[9:14,5] <- colSums(ploidy.annot[which(ploidy.annot$sex == "xy.0"),2:7])
+ploidy.comp[16:21,5] <- colSums(ploidy.annot[which(ploidy.annot$sex == "xo.0"),2:7])
+ploidy.comp[23:28,5] <- colSums(ploidy.annot[which(ploidy.annot$sex == "xx.10"),2:7])
+ploidy.comp[30:35,5] <- colSums(ploidy.annot[which(ploidy.annot$sex == "xy.10"),2:7])
+ploidy.comp[37:42,5] <- colSums(ploidy.annot[which(ploidy.annot$sex == "xo.10"),2:7])
+ploidy.comp[1,5] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xx.0" & ploidy.annot$condensed != "000000"),])
+ploidy.comp[8,5] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xy.0" & ploidy.annot$condensed != "000000"),])
+ploidy.comp[15,5] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xo.0" & ploidy.annot$condensed != "000000"),])
+ploidy.comp[22,5] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xx.10" & ploidy.annot$condensed != "000000"),])
+ploidy.comp[29,5] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xy.10" & ploidy.annot$condensed != "000000"),])
+ploidy.comp[36,5] <- nrow(ploidy.annot[which(ploidy.annot$sex == "xo.10" & ploidy.annot$condensed != "000000"),])
+ploidy.comp$an.perc <- ploidy.comp$Aneuploid/ploidy.comp$Total
+ploidy.comp$Chr <- factor(ploidy.comp$Chr, levels = c("total", 1:19))
+```
+
+```{r}
+set = c("total")
+a <- ggplot(ploidy.comp[ploidy.comp$Chr %in% set,], aes(x = Time, y = an.perc, col = Sex)) +
+  theme_classic() +
+  geom_line(size = 0.6) +
+  geom_point(size = 1.5) +
+  scale_color_manual(limits = c("XX", "XY", "XO"), values = c("#CC0000", "#183463", "#FFDA1F")) +
+  scale_x_continuous(breaks = c(0,10), labels = c("0", "+10"), limits = c(-1,11)) +
+  labs(title = ifelse(set == "total", "All Aneuploidies", paste("Aneuploid Chr", set)),
+       x = "Passages Since First Collection",
+       y = "Proportion of Cells Aneuploid",
+       col = "Chr Sex") +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        axis.title = element_text(size = 10),
+        axis.text = element_text(size = 9, color = "black"),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14)) +
+  guides(col = "none")
+
+b <- ggplot(ploidy.comp[which(ploidy.comp$Chr != "total"),], aes(x = Time, y = an.perc, col = Sex)) +
+  theme_classic() +
+  facet_wrap(~Chr, scales = "free") +
+  geom_line(size = 0.6) +
+  geom_point(size = 1.5) +
+  scale_color_manual(limits = c("XX", "XY", "XO"), values = c("#CC0000", "#183463", "#FFDA1F")) +
+  scale_x_continuous(breaks = c(0,10), labels = c("0", "+10"), limits = c(-1,11)) +
+  labs(title = "By Chromosome",
+       x = "Passages Since First Collection",
+       #y = "Proportion of Cells Aneuploid",
+       col = "Chr Sex") +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        axis.title = element_text(size = 10),
+        axis.text = element_text(size = 9),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        strip.background = element_rect(fill = "gray80"),
+        strip.text = element_text(size = 10, face = "bold")) +
+  guides(col = "none")
+
+tmp <- as.data.frame(cbind("sex" = ploidy.comp$Sex[1:21], "chr" = as.character(ploidy.comp$Chr[1:21]), "diff" = ploidy.comp$an.perc[22:42] - ploidy.comp$an.perc[1:21]))
+tmp$sex <- factor(tmp$sex, levels = c("XX", "XY", "XO"))
+tmp$chr <- factor(tmp$chr, levels = c("total", 1:19))
+tmp$diff <- as.numeric(tmp$diff)
+c <- ggplot(tmp, aes(x = chr, y = diff, fill = sex)) +
+  theme_classic() +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  geom_hline(yintercept = 0) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_discrete(labels = c("19","14","11","8","6","1","All"), limits = rev) +
+  scale_fill_manual(limits = c("XX", "XY", "XO"), values = c("#CC0000", "#183463", "#FFDA1F")) +
+  labs(x = "Aneuploid Chromosome",
+       y = "Change in Proportion") +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        axis.title = element_text(size = 10),
+        axis.text = element_text(size = 9),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        strip.background = element_rect(fill = "gray80"),
+        strip.text = element_text(size = 10, face = "bold")) +
+  coord_flip() +
+  guides(fill = "none")
+
+plot_grid(a,b,c, ncol = 3, rel_widths = c(1,1.7,1))
+```
+
+```{r}
+ups0 <- upset_data(ploidy.annot_p0, colnames(ploidy.annot_p0)[2:7])
+ups10 <- upset_data(ploidy.annot_p10, colnames(ploidy.annot_p10)[2:7])
+ups0 <- as.data.frame(ups0$sizes$exclusive_intersection)
+ups10 <- as.data.frame(ups10$sizes$exclusive_intersection)
+ups0$intersection <- rownames(ups0)
+ups10$intersection <- rownames(ups10)
+ups0$p0 <- ups0$`ups0$sizes$exclusive_intersection`/sum(ups0$`ups0$sizes$exclusive_intersection`)
+ups10$p10 <- ups10$`ups10$sizes$exclusive_intersection`/sum(ups10$`ups10$sizes$exclusive_intersection`)
+ups <- merge(ups0, ups10, by = "intersection", all = T)
+ups[is.na(ups)] <- 0
+ups2 <- ups2 <- melt(ups, id.vars = "intersection", measure.vars = c("p0", "p10"))
+ups2$intersection <- gsub("c", "", ups2$intersection)
+ups2$intersection <- gsub("-", " + ", ups2$intersection)
+ups2$intersection <- gsub("Outside of known sets", "Euploid", ups2$intersection)
+x <- arrange(ups2[which(ups2$variable == "p0"),], desc(ups2$value[which(ups2$variable == "p0")]))
+ggplot(ups2) +
+  theme_classic() +
+  geom_col(aes(x = intersection, y = value, fill = variable), col = "black", position = "dodge", width = 0.6) +
+  scale_x_discrete(limits = x$intersection) +
+  scale_y_continuous(expand = c(0,0), breaks = c(0.05, 0.1, 0.15, 0.2, 0.25, 0.85, 0.9)) +
+  scale_y_break(c(0.22,0.85)) +
+  scale_fill_manual(values = c("black", "gray70")) +
+  labs(y = "Proportion of Naive PSCs",
+       x = "") +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 11),
+        axis.text.x = element_text(size = 13, angle = 45, hjust = 1),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14)) +
+  guides(fill = "none")
+```
+
+---
+
+# (4) Human-mouse synteny analysis
+##### Load necessary libraries
+```{r}
+library(BioCircos)
+library(readr)
+library(reshape2)
+library(ungeviz)
+```
+##### Load necessary data
+Load in Rdata file "" into the R environment containing all necessary data for running this section of the code.
+
+As you run the code for each mouse chromosome, save a copy of 'mhconnections' as 'chr1overlap', 'chr6overlap', 'chr8overlap', or 'chr11overlap' respectively to be used for the quantification section.
+
+## Set parameters for the reference chromosome being looked at (repeat with each chromosome individually)
+```{r}
+# Set mouse reference chromosome info from the list below...
+## chr1 = 195154279
+## chr6 = 149588044
+## chr8 = 130127694
+## chr11 = 121973369
+mouselength <- 121973369
+chr <- 11
+mousechr <- "m11"
+mouse_syntenygenes <- mouse11_syntenygenes
+```
+
+## Generate circos plots of synteny between mouse reference chromosome and human genome
+```{r}
+# reformat data
+## keep genes with mouse and human position data
+genelist$Gene.Symbol <- toupper(genelist$Gene.Symbol)
+sharedgenes <- intersect(genelist$Gene.Symbol[which(genelist$Chr == as.character(chr))], mouse_syntenygenes$`Gene Symbol`)
+mgenes <- genelist[genelist$Gene.Symbol %in% sharedgenes,]
+hgenes <- mouse_syntenygenes[mouse_syntenygenes$`Gene Symbol` %in% sharedgenes,]
+## add mouse gene midpoint positions
+mgenes$midpoint <- mgenes$start + ((mgenes$end - mgenes$start)/2)
+## add human gene midpoint positions
+hgenes$midpoint <- hgenes$Start + ((hgenes$End - hgenes$Start)/2)
+## combine mouse and human gene positions
+mhconnections <- as.data.frame(matrix(ncol = 8, nrow = length(sharedgenes)))
+colnames(mhconnections) <- c("gene", "h.chr", "m.chr", "h.pos.start", "h.pos.end", "m.pos.start", "m.pos.end", "dup")
+mhconnections$gene <- sharedgenes
+mhconnections$h.chr <- hgenes$Chr[match(mhconnections$gene, hgenes$`Gene Symbol`)]
+mhconnections$m.chr <- mgenes$Chr[match(mhconnections$gene, mgenes$Gene.Symbol)]
+mhconnections$h.pos.start <- hgenes$Start[match(mhconnections$gene, hgenes$`Gene Symbol`)]
+mhconnections$h.pos.end <- hgenes$End[match(mhconnections$gene, hgenes$`Gene Symbol`)]
+mhconnections$m.pos.start <- mgenes$start[match(mhconnections$gene, mgenes$Gene.Symbol)]
+mhconnections$m.pos.end <- mgenes$end[match(mhconnections$gene, mgenes$Gene.Symbol)]
+mhconnections$dup <- rep("no", nrow(mhconnections))
+### get gene names in duplicated human chromosome regions
+h1dup <- intersect(intersect(hgenes$`Gene Symbol`[which(hgenes$Chr == "1")], hgenes$`Gene Symbol`[which(hgenes$midpoint > 198700001)]), hgenes$`Gene Symbol`[which(hgenes$midpoint < 214400000)])
+h7dup <- intersect(intersect(hgenes$`Gene Symbol`[which(hgenes$Chr == "7")], hgenes$`Gene Symbol`[which(hgenes$midpoint > 1)]), hgenes$`Gene Symbol`[which(hgenes$midpoint < 60100001)])
+h12dup <- intersect(intersect(hgenes$`Gene Symbol`[which(hgenes$Chr == "12")], hgenes$`Gene Symbol`[which(hgenes$midpoint > 1)]), hgenes$`Gene Symbol`[which(hgenes$midpoint < 10000000)])
+h14dup <- intersect(intersect(hgenes$`Gene Symbol`[which(hgenes$Chr == "14")], hgenes$`Gene Symbol`[which(hgenes$midpoint > 1)]), hgenes$`Gene Symbol`[which(hgenes$midpoint < 107043718)])
+h17dup <- intersect(intersect(hgenes$`Gene Symbol`[which(hgenes$Chr == "17")], hgenes$`Gene Symbol`[which(hgenes$midpoint > 72900001)]), hgenes$`Gene Symbol`[which(hgenes$midpoint < 83257441)])
+h18dup <- intersect(intersect(hgenes$`Gene Symbol`[which(hgenes$Chr == "18")], hgenes$`Gene Symbol`[which(hgenes$midpoint > 45900001)]), hgenes$`Gene Symbol`[which(hgenes$midpoint < 63900000)])
+dupgenes <- unique(c(h1dup, h7dup, h12dup, h14dup, h17dup, h18dup))
+### annotate genes in duplicated regions
+mhconnections$dup[which(mhconnections$h.chr %in% c('1', '7', '12', '14', '17', '20', 'X'))] <- "chr"
+mhconnections$dup[which(mhconnections$gene %in% dupgenes)] <- "seg"
+### separate table by 'dup' column
+mhconnections1 <- mhconnections[which(mhconnections$dup == "no"),]
+mhconnections2 <- mhconnections[which(mhconnections$dup == "chr"),]
+mhconnections3 <- mhconnections[which(mhconnections$dup == "seg"),]
+
+# generate genome lengths
+genome <- c(mouselength, h.genome$length.bp)
+names(genome) <- c(mousechr, paste0("h", h.genome$chr))
+
+# generate arc track of human duplications
+arcs_chromosomes = c('h1', 'h7', 'h12', 'h14', 'h17', 'h20', 'hX')
+arcs_segments <- c('h1', 'h7', 'h12', 'h17', 'h18')
+chr_begin <- c(1,1,1,1,1,1,1)
+chr_end <- c(h.genome$length.bp[c(1,7,12,14,17,20,23)])
+seg_begin = c(198700001, 1, 1, 72900001, 45900001)
+seg_end = c(214400000, 60100001, 10000000, 83257441, 63900000)
+arcs_c <- BioCircosArcTrack('myChrArcTrack', arcs_chromosomes, chr_begin, chr_end, minRadius = 1.15, maxRadius = 1.2, opacities = c(1), colors = "#66cd33")
+arcs_s <- BioCircosArcTrack('mySegArcTrack', arcs_segments, seg_begin, seg_end, minRadius = 1.21, maxRadius = 1.26, opacities = c(1), colors = "black")
+# generate links
+links1 <- BioCircosLinkTrack('myLinkTrack', paste0("m", mhconnections1$m.chr), mhconnections1$m.pos.start, mhconnections1$m.pos.end, paste0("h", mhconnections1$h.chr), mhconnections1$h.pos.start, mhconnections1$h.pos.end, maxRadius = 0.98, color = '#b3b3b3')
+links2 <- BioCircosLinkTrack('myLinkTrack', paste0("m", mhconnections2$m.chr), mhconnections2$m.pos.start, mhconnections2$m.pos.end, paste0("h", mhconnections2$h.chr), mhconnections2$h.pos.start, mhconnections2$h.pos.end, maxRadius = 0.98, color = '#66cd33')
+links3 <- BioCircosLinkTrack('myLinkTrack', paste0("m", mhconnections3$m.chr), mhconnections3$m.pos.start, mhconnections3$m.pos.end, paste0("h", mhconnections3$h.chr), mhconnections3$h.pos.start, mhconnections3$h.pos.end, maxRadius = 0.98, color = 'black')
+
+# generate plot
+BioCircos(tracklist = c(arcs_c, arcs_s, links1, links2, links3), genome = genome, genomeLabelDy = 25, genomeFillColor = c("darkorchid", rep("gray70", 24)), genomeTicksDisplay = F)
+```
+
+```{r}
+# combine data sets
+allOverlap <- rbind(chr1overlap, chr6overlap, chr8overlap, chr11overlap)
+# count by number of genes in each human chromosome by synteny category
+synFreq <- ddply(allOverlap, .(allOverlap$m.chr, allOverlap$h.chr, allOverlap$dup), nrow)
+colnames(synFreq) <- c("m.chr", "h.chr", "dup", "count")
+synFreq$dup <- factor(synFreq$dup, levels = c("no", "chr", "seg"))
+
+# generate list of proportions by synteny category
+synProp <- as.data.frame(matrix(nrow = 4, ncol = 8))
+## columns for: 
+## total number of human syntenic genes
+## genes not syntenic to hPSC duplications
+## genes syntenic to hPSC whole chromosome duplication
+## genes syntenic to hPSC minimal duplication
+## proportions of the total for the previous 3 categories
+colnames(synProp) <- c("m.chr", "total", "general", "whole", "partial", "gprop", "wprop", "pprop")
+## rows for each duplicated mouse chromosome
+synProp[,1] <- c(1, 6, 8, 11)
+## add total genes
+synProp[,2] <- unname(table(allOverlap$m.chr))
+## add number of genes each category
+synProp[,3:5] <- table(allOverlap$m.chr, allOverlap$dup)[,c(2,1,3)]
+## calculate proportions
+synProp[,6:8] <- synProp[,3:5]/synProp[,2]
+## melt data.frame to plot
+synProp <- melt(synProp, id.vars = "m.chr", measure.vars = c("gprop", "wprop", "pprop"))
+synProp$variable <- factor(synProp$variable, levels = c("gprop", "wprop", "pprop"))
+
+# plot
+ggplot(synFreq) +
+  theme_classic() +
+  geom_bar(aes(y = count, x = as.factor(m.chr), fill = dup), 
+           #col = "white", 
+           stat = "identity", width = 0.5) +
+  scale_fill_manual(values = c("gray70", "#66cd33", "black")) +
+  scale_x_discrete(limits = rev) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Mouse Chromosome",
+       y = "Number of Genes") +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18)) +
+  coord_flip() +
+  guides(fill = "none")
+```
+
+---
+
+# (5) Flow cytometry analysis
+##### Load necessary libraries
+```{r}
+library(ggbeeswarm)
+library(ggplot2)
+library(ggcyto)
+library(readr)
+library(cowplot)
+library(viridis)
+library(ggpointdensity)
+library(ptinpoly)
+library(dplyr)
+library(ungeviz)
+```
+##### Load necessary data
+Set working directory to the folder containing the flow cytometry data.
+
+```{r}
+# import data
+files <- list.files(pattern = "*.csv")
+data = lapply(files, read.csv)
+names(data) <- c("gs", "g", "mervl", "ns", "O1", "O2", "O3", "X1", "X2", "X3", "Y1", "Y2", "Y3")
+
+# subsets
+comp <- c("gs", "X1", "X2", "X3", "O1", "O2", "O3", "Y1", "Y2", "Y3")
+data.comp <- data[which(names(data) %in% comp)]
+
+# align data
+## before adjustment
+plot(data.comp[[1]]$Comp.FITC.A, data.comp[[1]]$SSC.H, ylim= c(0,1100*10))
+for (s in c(2:10)) {
+  points(data.comp[[s]]$Comp.FITC.A, data.comp[[s]]$SSC.H + 1100*(s-1), col = rainbow(9)[s-1])
+}
+## find median mervl expression of samples
+mdat <- data.frame(matrix(nrow = 10, ncol = 3))
+colnames(mdat) <- c("sample", "median", "adjustment")
+mdat$sample <- comp
+## find highest median
+for (s in c(1:10)) {
+  mdat[s,2] <- median(data.comp[[comp[s]]]$Comp.FITC.A)
+}
+## find differences between highest median and all others
+for (s in c(1:10)) {
+  mdat[s,3] <- max(mdat$median) - mdat$median[s]
+}
+## adjust all so medians overlap
+for (s in c(1:10)) {
+  data.comp[[comp[s]]]$madj <- data.comp[[comp[s]]]$Comp.FITC.A + mdat$adjustment[s]
+}
+## after adjustment
+plot(data.comp[[1]]$madj, data.comp[[1]]$SSC.H, ylim= c(0,1100*10))
+for (s in c(2:10)) {
+  points(data.comp[[s]]$madj, data.comp[[s]]$SSC.H + 1100*(s-1), col = rainbow(9)[s-1])
+}
+```
+
+```{r}
+plotdat <- as.data.frame(bind_rows(data.comp, .id = "sample"))
+plotdat$twoc2 <- ifelse(plotdat$madj >= 760, T, F)
+plotdat$sample <- factor(plotdat$sample, levels = comp)
+sample.names <- c("Ghost + secondary", "XX1", "XX2", "XX3", "XO1", "XO2", "XO3", "XY1", "XY2", "XY3")
+names(sample.names) <- comp
+
+tcp <- table(plotdat$sample, plotdat$twoc2)[,2]/(table(plotdat$sample, plotdat$twoc2)[,1] + table(plotdat$sample, plotdat$twoc2)[,2])*100
+tcp <- data.frame("sample" = names(tcp), "perc2c" = unname(tcp))
+plotdat$tcp <- tcp$perc2c[match(plotdat$sample, tcp$sample)]
+
+ggplot(plotdat[which(plotdat$sample != "gs"),]) +
+  theme_classic() +
+  geom_point(aes(x = madj, y = SSC.H, fill = sample), shape = 21, col = "black", size = 1) +
+  geom_text(aes(label = paste0(round(tcp, 2), "%")), x = 980, y = 80, col = "black", size = 5) +
+  facet_wrap(~sample, labeller = labeller(sample = sample.names), ncol = 3) +
+  scale_fill_manual(values = c(rep(c("#CC0000", "#E4C525", "#244D94"), each = 3))) +
+  scale_x_continuous(n.breaks = 6) +
+  scale_y_continuous(n.breaks = 6, expand = c(0,0)) +
+  labs(x = "Adjusted Anti-MERVL-gag (FITC)",
+       y = "SSC-height",
+       color = "Chromosomal\nSex") +
+  annotate("segment", x = 760, xend = 1100, y = 0, yend = 0) +
+  annotate("segment", x = 1100, xend = 1100, y = 0, yend = 1050) +
+  annotate("segment", x = 1100, xend = 760, y = 1050, yend = 1050) +
+  annotate("segment", x = 760, xend = 760, y = 1050, yend = 0) +
+  theme(strip.text = element_text(size = 10, face = "bold"),
+        strip.background = element_rect(fill = "gray80"),
+        axis.title = element_text(size = 20),
+        axis.text = element_text(size = 16, color = "black"),
+        strip.text.x = element_text(size = 16)) +
+  guides(fill = "none")
+
+ggplot(plotdat[which(plotdat$sample != "gs"),]) +
+  theme_classic() +
+  geom_point(aes(x = madj, y = SSC.H, fill = sample, col = sample), shape = 21, size = 1) +
+  facet_wrap(~sample, labeller = labeller(sample = sample.names), ncol = 3) +
+  scale_fill_manual(values = c(rep(c("#CC0000", "#E4C525", "#244D94"), each = 3))) +
+  scale_color_manual(values = c(rep(c("#CC0000", "#E4C525", "#244D94"), each = 3))) +
+  scale_x_continuous(n.breaks = 6) +
+  scale_y_continuous(n.breaks = 6, expand = c(0,0)) +
+  labs(x = "Adjusted Anti-MERVL-gag (FITC)",
+       y = "SSC-height",
+       color = "Chromosomal\nSex") +
+  annotate("segment", x = 760, xend = 1100, y = 0, yend = 0) +
+  annotate("segment", x = 1100, xend = 1100, y = 0, yend = 1050) +
+  annotate("segment", x = 1100, xend = 760, y = 1050, yend = 1050) +
+  annotate("segment", x = 760, xend = 760, y = 1050, yend = 0) +
+  theme(strip.text.x = element_blank(),
+        strip.background = element_rect(fill = "gray80"),
+        axis.title = element_blank(),
+        axis.text = element_blank()) +
+  guides(fill = "none",
+         color = "none")
+
+tcp$chrsex <- c(NA, rep("XX", 3), rep("XO", 3), rep("XY", 3))
+tcp$xcount <- c(NA, rep("2X", 3), rep("1X", 6))
+
+test <- t.test(tcp$perc2c ~ tcp$xcount)
+
+ggplot(tcp[2:10,]) +
+  theme_classic() +
+  geom_boxplot(aes(x = chrsex, y = perc2c, col = chrsex)) +
+  scale_x_discrete(limits = c("XX", "XO", "XY")) +
+  scale_color_manual(values = c("#E4C525", "#CC0000", "#244D94")) +
+  labs(col = "Sex Chromosomes")
+
+ggplot(tcp[2:10,]) +
+  theme_classic() +
+  geom_dotplot(aes(x = xcount, y = perc2c, fill = chrsex), binaxis = "y", stackdir = "center", dotsize = 1.5, position = "dodge") +
+  annotate("segment", x = 0.9, xend = 2.1, y = 1, yend = 1) +
+  annotate("text", x = 1.5, y = 1.02, label = paste0("p = ", round(test$p.value, 4)), size = 5) +
+  scale_x_discrete(limits = c("2X", "1X")) +
+  scale_fill_manual(values = c("#E4C525", "#CC0000", "#244D94")) +
+  labs(x = "Chromosome X\nDosage",
+       y = "2CLC Percentage") +
+  theme(strip.text = element_text(size = 10, face = "bold"),
+        strip.background = element_rect(fill = "gray80"),
+        axis.title = element_text(size = 20),
+        axis.text = element_text(size = 16, color = "black")) +
+  guides(fill = "none")
+```
+
+---
+
+# (6) Karyotype annotations from WiCell analyzed human pluripotent stem cells
+##### Load necessary libraries
+```{r}
+library(ggplot2)
+```
+
+```{r}
+# WiCell/Sheffield hPSC data
+
+## hESC data
+### XX total = 1547
+#### Abnormal = 357
+#### Normal = 1190
+### XY total = 1773
+#### Abnormal = 399
+#### Normal = 1374
+
+## hiPSC data
+### XX total = 7145
+#### Abnormal = 1580
+#### Normal = 5565
+### XY total = 9422
+#### Abnormal = 2536
+#### Normal = 6886
+
+## generate data.frame to contain aneuploidy data
+wcdat <- as.data.frame(matrix(nrow = 4, ncol = 7))
+colnames(wcdat) <- c("type", "sex", "total", "aneuploid", "euploid", "an.perc", "chisq")
+wcdat[,1] <- rep(c("hESCs", "hiPSCs"), each = 2)
+wcdat[,2] <- rep(c("XX", "XY"),2)
+wcdat[,3] <- c(1547,1773,7145,9422)
+wcdat[,4] <- c(357,399,1580,2536)
+wcdat[,5] <- c(1190,1374,5565,6886)
+wcdat[,6] <- wcdat[,4]/wcdat[,3]
+wcdat[1:2,7] <- chisq.test(wcdat[1:2,4:5])$p.value
+wcdat[3:4,7] <- chisq.test(wcdat[3:4,4:5])$p.value
+
+## plot
+ggplot(wcdat) +
+  theme_classic() +
+  facet_wrap(~type) +
+  geom_bar(aes(y = sex, x = an.perc*100, fill = sex), stat = "identity", position = position_dodge(), col = "black") +
+  scale_fill_manual(values = c("#CC0000", "#244D94")) +
+  labs(y = "Chromosomal Sex",
+       x = "Percentage of Aneuploid Lines") +
+  scale_y_discrete(labels = c("XY", "XX"), limits = rev) +
+  scale_x_continuous(expand = c(0,0), limits = c(0,30)) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 22),
+        axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20),
+        strip.background = element_rect(fill = "gray80"),
+        strip.text = element_text(size = 10, face = "bold")) #+
+  annotate("segment", x = 25, xend = 25, y = 1, yend = 2) +
+  annotate("text", x = 27, y = 1.5, label = paste0("p-val = ", signif(wcdat$p.value, 3)))
+```
+
+
+
+
+
